@@ -15,12 +15,24 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# 3. The "Ask Binance" Function (HTTP Polling)
-def get_binance_data():
+# --- SIDEBAR (USER INPUT) ---
+st.sidebar.header("⚙ Configuration")
+# Default is BTC-USD. User can type anything.
+user_input = st.sidebar.text_input("Enter Symbol (Coinbase)", "BTC-USD")
+symbol = user_input.upper() # Auto-convert 'btc-usd' to 'BTC-USD'
+
+st.sidebar.caption(f"Tracking: {symbol}")
+st.sidebar.markdown("---")
+st.sidebar.write("✅ *Active Connection*")
+st.sidebar.write("📡 *Source:* Coinbase Prime")
+
+# 3. The "Ask Coinbase" Function (Dynamic)
+def get_market_data(symbol):
     try:
-        # We use the US API because Streamlit servers are in the US
-        url = "https://api.binance.us/api/v3/depth?symbol=BTCUSDT&limit=20"
-        response = requests.get(url, timeout=5)
+        # We inject the {symbol} variable into the URL
+        url = f"https://api.exchange.coinbase.com/products/{symbol}/book?level=2"
+        headers = {"User-Agent": "LiquidityLens/1.0"}
+        response = requests.get(url, headers=headers, timeout=5)
         return response.json()
     except:
         return None
@@ -34,28 +46,33 @@ def calculate_ofi(bids, asks):
 
 def get_walls(orders):
     walls = []
-    for p, q in orders:
-        val = float(p) * float(q)
-        if val > 50000: # $50k Threshold for US Exchange
-            walls.append(f"${val/1000:.0f}k @ {float(p):.2f}")
+    for order in orders:
+        price = float(order[0])
+        size = float(order[1])
+        val = price * size
+        # Dynamic Threshold: If price < $1000 (like SOL), use $10k wall. Else $50k.
+        threshold = 10000 if price < 1000 else 50000
+        
+        if val > threshold: 
+            walls.append(f"${val/1000:.0f}k @ {price:.2f}")
     return walls[:3]
 
-# 5. The App Layout
-st.title("🦅 Liquidity Sniper (Live V4.0)")
-st.caption("Institutional Order Flow Detector (US Cloud Server Edition)")
+# 5. App Layout
+st.title(f"🦅 Liquidity Sniper: {symbol}")
 
-# Layout Columns
 col1, col2 = st.columns([2, 1])
 placeholder = st.empty()
 
 # 6. The Loop
 while True:
-    data = get_binance_data()
+    # Pass the user's symbol to the function
+    data = get_market_data(symbol)
     
     with placeholder.container():
+        # Error Handling: If user types "GARBAGE", Coinbase returns a message, not bids
         if not data or 'bids' not in data:
-            st.warning("📡 Pinging Binance API... (If this persists, refresh page)")
-            time.sleep(1)
+            st.error(f"❌ Could not find symbol '{symbol}'. Try 'ETH-USD' or 'SOL-USD'.")
+            time.sleep(2)
             continue
             
         bids = data['bids']
@@ -63,7 +80,6 @@ while True:
         price = float(bids[0][0])
         ofi = calculate_ofi(bids, asks)
         
-        # Determine Sentiment
         sentiment = "NEUTRAL ⚪"
         color = "white"
         if ofi > 0.1: 
@@ -73,15 +89,13 @@ while True:
             sentiment = "BEARISH 🔴"
             color = "#FF0000"
             
-        # Top Metrics
         m1, m2, m3 = st.columns(3)
-        m1.metric("Bitcoin Price", f"${price:,.2f}")
+        m1.metric("Price", f"${price:,.2f}")
         m2.metric("OFI Pressure", f"{ofi:.3f}")
         m3.markdown(f"*Sentiment:* <span style='color:{color}'>{sentiment}</span>", unsafe_allow_html=True)
         
         st.divider()
         
-        # Walls
         wc1, wc2 = st.columns(2)
         with wc1:
             st.write("🛡 *Buy Walls (Support)*")
@@ -99,5 +113,4 @@ while True:
             else:
                 st.info("No Walls Detected")
 
-    # Wait 1 second before asking again (To respect API limits)
     time.sleep(1)
