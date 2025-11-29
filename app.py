@@ -4,6 +4,7 @@ import time
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime
 import os
 
@@ -12,10 +13,8 @@ st.set_page_config(page_title="Liquidity Sniper Pro", page_icon="🦅", layout="
 st.markdown("""
     <style>
     .metric-card { background-color: #0E1117; padding: 15px; border-radius: 10px; border: 1px solid #333; }
-    /* Bigger Tabs */
-    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-    font-size: 1.2rem;
-    }
+    .stTabs [data-baseweb="tab-list"] { gap: 20px; }
+    .stTabs [data-baseweb="tab-list"] button { font-size: 1.1rem; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -76,7 +75,6 @@ def get_real_volatility(symbol):
     return st.session_state.vol_data
 
 def run_monte_carlo(current_price, volatility, simulations=5000):
-    # INCREASED SIMULATIONS TO 5000 TO STABILIZE THE NUMBER
     daily_return = np.random.normal(0, volatility, simulations)
     future_prices = current_price * (1 + daily_return)
     future_prices = np.sort(future_prices)
@@ -100,15 +98,53 @@ def get_walls(orders, price):
             walls.append((p, val))
     return walls[:3]
 
-# --- 5. CHARTING ---
-def plot_chart(df, vwap_series, symbol, stop_loss, buy_walls, sell_walls):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df['time'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"))
-    fig.add_trace(go.Scatter(x=df['time'], y=vwap_series, mode='lines', name='VWAP', line=dict(color='orange', width=2)))
-    fig.add_hline(y=stop_loss, line_dash="dot", line_color="#FF00FF", annotation_text="🛑 VaR Stop Loss")
-    for p, v in buy_walls: fig.add_hline(y=p, line_color="#00FF00", opacity=0.3)
-    for p, v in sell_walls: fig.add_hline(y=p, line_color="#FF0000", opacity=0.3)
-    fig.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0), xaxis_rangeslider_visible=False)
+# --- 5. SMOOTH CHARTING ENGINE (V21) ---
+def plot_professional_chart(df, vwap_series, rsi_series, symbol, stop_loss, buy_walls, sell_walls):
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.03, row_heights=[0.75, 0.25])
+
+    # 1. Main Candlestick Chart
+    fig.add_trace(go.Candlestick(
+        x=df['time'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+        name="Price",
+        increasing_line_color='#26a69a', increasing_fillcolor='#26a69a',
+        decreasing_line_color='#ef5350', decreasing_fillcolor='#ef5350'
+    ), row=1, col=1)
+
+    # 2. VWAP
+    fig.add_trace(go.Scatter(x=df['time'], y=vwap_series, mode='lines', name='VWAP', line=dict(color='#ff9800', width=1.5)), row=1, col=1)
+    
+    # 3. Stop Loss
+    fig.add_hline(y=stop_loss, line_dash="dot", line_color="#d500f9", row=1, col=1, annotation_text="VaR Risk")
+
+    # 4. Liquidity Walls
+    for p, v in buy_walls:
+        fig.add_hline(y=p, line_color="rgba(0, 255, 0, 0.3)", row=1, col=1)
+    for p, v in sell_walls:
+        fig.add_hline(y=p, line_color="rgba(255, 0, 0, 0.3)", row=1, col=1)
+
+    # 5. RSI
+    fig.add_trace(go.Scatter(x=df['time'], y=rsi_series, mode='lines', name='RSI', line=dict(color='#7e57c2', width=1.5)), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="gray", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="gray", row=2, col=1)
+
+    # --- THE MAGIC FIX: UIREVISION ---
+    # This keeps the user's zoom level LOCKED even when data updates.
+    fig.update_layout(
+        template="plotly_dark",
+        height=700,
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_rangeslider_visible=False,
+        plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+        font=dict(family="Roboto", size=12, color="#b2b5be"),
+        hovermode='x unified',
+        uirevision='TheTruth' # <--- This prevents the chart from resetting zoom!
+    )
+    
+    fig.update_xaxes(showgrid=False, row=1, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor="#1e222d", row=1, col=1)
+    fig.update_yaxes(range=[0, 100], row=2, col=1)
+
     return fig
 
 # --- 6. APP LOGIC ---
@@ -132,6 +168,16 @@ if not book_data or candle_data.empty:
 bids = book_data['bids']
 asks = book_data['asks']
 price = float(bids[0][0])
+
+# --- LIVE CANDLE STITCHING (Makes the last candle move!) ---
+# We take the live orderbook price and force update the latest candle
+# This ensures the chart ticks in real-time.
+last_idx = candle_data.index[-1]
+candle_data.at[last_idx, 'close'] = price
+if price > candle_data.at[last_idx, 'high']: candle_data.at[last_idx, 'high'] = price
+if price < candle_data.at[last_idx, 'low']: candle_data.at[last_idx, 'low'] = price
+# -----------------------------------------------------------
+
 ofi = calculate_ofi(bids, asks)
 rsi, vwap_val, vwap_series = calculate_indicators(candle_data)
 
@@ -158,7 +204,7 @@ else:
 if score >= 3: signal = "PERFECT BUY 🟢"
 elif score <= -3: signal = "PERFECT SELL 🔴"
 
-# RISK CALCULATION (Smoother with 5000 sims)
+# RISK CALCULATION
 vol = get_real_volatility(symbol)
 stop_loss_price = run_monte_carlo(price, vol)
 percent_drop = (price - stop_loss_price) / price
@@ -170,54 +216,43 @@ if "PERFECT" in signal and signal != st.session_state.get('last_sig', ''):
     st.session_state.last_sig = signal
     st.toast("Trade Logged!")
 
-# --- UI TABS (THE CLEANUP) ---
+# --- UI TABS ---
 st.title(f"🦅 {symbol} Command Center")
-tab1, tab2 = st.tabs(["🚀 Dashboard", "📈 Chart & Analysis"])
+tab1, tab2 = st.tabs(["🚀 Dashboard", "📈 Pro Chart"])
 
-# TAB 1: EXECUTIVE SUMMARY (NO CHART)
 with tab1:
-    # Top Metrics
     c1, c2, c3 = st.columns(3)
     c1.metric("Current Price", f"${price:,.2f}")
     c2.metric("OFI Pressure", f"{ofi:.3f}")
     c3.metric("RSI Momentum", f"{rsi:.1f}")
-    
     st.divider()
-    
-    # Signal & Risk
     sc1, sc2 = st.columns(2)
     with sc1:
         st.subheader("🎯 Signal Output")
         st.markdown(f"## {signal}")
         for r in reasons: st.caption(f"• {r}")
-        
     with sc2:
         st.subheader("🎲 Risk Monitor")
         risk_color = "green" if dollar_risk < (trade_size * 0.02) else "red"
         st.markdown(f"#### Stop Loss: **${stop_loss_price:,.2f}**")
         st.markdown(f"Potential Loss: <span style='color:{risk_color}'>**-${dollar_risk:.2f}**</span>", unsafe_allow_html=True)
-        st.caption("Updated live based on 5,000 Monte Carlo simulations")
-
     st.divider()
-    
-    # Walls
     wc1, wc2 = st.columns(2)
     with wc1:
         st.write("🛡️ **Buy Walls**")
-        walls = get_walls(bids, price)
-        if walls:
+        if (walls := get_walls(bids, price)):
             for p, v in walls: st.success(f"${v/1000:.0f}k @ {p:.2f}")
         else: st.info("No Walls")
     with wc2:
         st.write("⚔️ **Sell Walls**")
-        walls = get_walls(asks, price)
-        if walls:
+        if (walls := get_walls(asks, price)):
             for p, v in walls: st.error(f"${v/1000:.0f}k @ {p:.2f}")
         else: st.info("No Walls")
 
-# TAB 2: THE CHART (FULL SCREEN)
 with tab2:
-    st.plotly_chart(plot_chart(candle_data, vwap_series, symbol, stop_loss_price, get_walls(bids, price), get_walls(asks, price)), use_container_width=True)
+    # We pass the "Stitched" candle data to the chart
+    rsi_full_series = calculate_indicators(candle_data)[2]
+    st.plotly_chart(plot_professional_chart(candle_data, vwap_series, rsi_full_series, symbol, stop_loss_price, get_walls(bids, price), get_walls(asks, price)), use_container_width=True, key="live_chart")
 
 time.sleep(1)
 st.rerun()
