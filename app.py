@@ -2,169 +2,192 @@ import streamlit as st
 import requests
 import time
 import pandas as pd
+import numpy as np
 from datetime import datetime
 import os
 
-# --- 1. CONFIG ---
-st.set_page_config(page_title="Liquidity Sniper", page_icon="🦅", layout="wide")
+# --- 1. CONFIGURATION ---
+st.set_page_config(page_title="Liquidity Sniper Pro", page_icon="🦅", layout="wide")
 st.markdown("""
     <style>
     .metric-card { background-color: #0E1117; padding: 15px; border-radius: 10px; border: 1px solid #333; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. LOGGING ENGINE (Fixed) ---
-LOG_FILE = "forward_test_logs.csv"
-
-# Function to ensure file exists
-def init_log_file():
+# --- 2. LOGGING ENGINE (The Black Box) ---
+LOG_FILE = "sniper_logs.csv"
+def init_log():
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w") as f:
-            f.write("Timestamp,Symbol,Price,OFI_Pressure,Sentiment,Signal,Reason\n")
+            f.write("Time,Symbol,Price,OFI,RSI,Signal,Risk_VaR\n")
 
-def log_trade(symbol, price, ofi, sentiment, signal, reason):
-    init_log_file() # Double check file exists
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = f"{timestamp},{symbol},{price},{ofi:.4f},{sentiment},{signal},{reason}\n"
+def log_trade(symbol, price, ofi, rsi, signal, risk):
+    init_log()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a") as f:
-        f.write(entry)
+        f.write(f"{ts},{symbol},{price},{ofi:.3f},{rsi:.1f},{signal},{risk}\n")
 
-# Initialize on Startup
-init_log_file()
+init_log()
 
-# --- 3. HELPER FUNCTIONS ---
-def clean_user_input(user_input):
-    sym = user_input.replace(" ", "").upper()
-    MAPPING = {
-        "GOLD": "PAXG-USD", "XAUUSD": "PAXG-USD", "XAU": "PAXG-USD",
-        "BITCOIN": "BTC-USD", "BTC": "BTC-USD", "ETH": "ETH-USD"
-    }
-    if sym in MAPPING: return MAPPING[sym]
-    if not "-" in sym and len(sym) > 3: sym = f"{sym[:-3]}-{sym[-3:]}"
-    return sym
-
-def get_market_data(sym):
+# --- 3. DATA ENGINE (Coinbase Institutional) ---
+def get_orderbook(sym):
     try:
         url = f"https://api.exchange.coinbase.com/products/{sym}/book?level=2"
         headers = {"User-Agent": "LiquidityLens/1.0"}
         return requests.get(url, headers=headers, timeout=5).json()
-    except:
-        return None
+    except: return None
+
+def get_candles(sym, granularity=300):
+    """
+    Fetches price history. 
+    Granularity 300 = 5min candles (for RSI/VWAP)
+    Granularity 86400 = 1day candles (for Volatility)
+    """
+    try:
+        url = f"https://api.exchange.coinbase.com/products/{sym}/candles?granularity={granularity}"
+        headers = {"User-Agent": "LiquidityLens/1.0"}
+        res = requests.get(url, headers=headers, timeout=5).json()
+        if not res: return pd.DataFrame()
+        # Coinbase returns [time, low, high, open, close, volume]
+        df = pd.DataFrame(res, columns=["time", "low", "high", "open", "close", "vol"])
+        df = df.sort_values("time").reset_index(drop=True)
+        return df
+    except: return pd.DataFrame()
+
+# --- 4. MATH ENGINE ---
+def calculate_indicators(df):
+    if df.empty: return 50, 0
+    # RSI (14 Period)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    # VWAP
+    df['tp'] = (df['high'] + df['low'] + df['close']) / 3
+    df['pv'] = df['tp'] * df['vol']
+    vwap = df['pv'].cumsum() / df['vol'].cumsum()
+    return rsi.iloc[-1], vwap.iloc[-1]
+
+def get_real_volatility(symbol):
+    """Calculates REAL Daily Volatility from last 30 days"""
+    df = get_candles(symbol, granularity=86400) # Daily candles
+    if df.empty: return 0.05
+    returns = df['close'].pct_change().dropna()
+    return returns.std()
+
+def run_monte_carlo(current_price, volatility, simulations=1000):
+    """Simulates 1,000 futures to find max downside risk"""
+    future_prices = []
+    for x in range(simulations):
+        daily_return = np.random.normal(0, volatility)
+        simulated_price = current_price * (1 + daily_return)
+        future_prices.append(simulated_price)
+    future_prices = np.sort(future_prices)
+    var_95 = np.percentile(future_prices, 5) # 95% Confidence Level
+    return var_95
 
 def calculate_ofi(bids, asks):
     if not bids: return 0
-    bid_vol = sum([float(x[1]) for x in bids])
-    ask_vol = sum([float(x[1]) for x in asks])
-    return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+    b_vol = sum([float(x[1]) for x in bids])
+    a_vol = sum([float(x[1]) for x in asks])
+    return (b_vol - a_vol) / (b_vol + a_vol)
 
-def get_walls(orders, price):
-    walls = []
-    threshold = 50000 if price > 1000 else 10000 
-    for order in orders:
-        p = float(order[0])
-        s = float(order[1])
-        val = p * s
-        if val > threshold:
-            walls.append(f"${val/1000:.0f}k @ {p:.2f}")
-    return walls[:3]
+# --- 5. UI & LOGIC ---
+st.sidebar.header("⚙️ Sniper Scope")
+sym_input = st.sidebar.text_input("Symbol", "BTC-USD").upper()
 
-# --- 4. SIDEBAR SETTINGS ---
-st.sidebar.header("⚙️ Settings")
-if "symbol" not in st.session_state:
-    st.session_state.symbol = "BTC-USD"
+# Symbol Mapping
+MAP = {"GOLD": "PAXG-USD", "XAUUSD": "PAXG-USD", "BITCOIN": "BTC-USD", "SOL": "SOL-USD"}
+symbol = MAP.get(sym_input, sym_input)
+if "-" not in symbol and len(symbol)>3: symbol = f"{symbol[:-3]}-{symbol[-3:]}"
 
-raw_input = st.sidebar.text_input("Enter Symbol", st.session_state.symbol)
-symbol = clean_user_input(raw_input)
-st.session_state.symbol = raw_input 
-
-st.sidebar.markdown("---")
-st.sidebar.info(f"Tracking: {symbol}")
-
-# DEBUG BUTTON: Force a log entry
-if st.sidebar.button("🛠️ Test Log Entry"):
-    log_trade(symbol, 0, 0, "TEST", "TEST_SIGNAL", "Manual Check")
-    st.toast("Test Row Added!")
-
-# --- 5. MAIN APP ---
 st.title(f"🦅 Liquidity Sniper: {symbol}")
 
-# STATE MANAGEMENT
-if "last_signal" not in st.session_state:
-    st.session_state.last_signal = "INIT"
+# Get Data
+book_data = get_orderbook(symbol)
+candle_data = get_candles(symbol, 300)
 
-# FETCH DATA
-data = get_market_data(symbol)
-
-if not data or 'bids' not in data:
-    st.error(f"❌ Waiting for data for {symbol}...")
+if not book_data or candle_data.empty:
+    st.error(f"Waiting for data on {symbol}...")
     time.sleep(1)
     st.rerun()
 
-bids = data['bids']
-asks = data['asks']
+bids = book_data['bids']
+asks = book_data['asks']
 price = float(bids[0][0])
 ofi = calculate_ofi(bids, asks)
+rsi, vwap = calculate_indicators(candle_data)
 
-# SIGNAL LOGIC
-signal = "NEUTRAL"
-reason = "Choppy"
-if ofi > 0.15:
-    signal = "BUY"
-    reason = "Aggressive Buying"
-elif ofi < -0.15:
-    signal = "SELL"
-    reason = "Aggressive Selling"
+# --- CONFLUENCE CHECK ---
+signal = "WAIT"
+score = 0
+reasons = []
 
-# AUTO LOGGING
-if signal != st.session_state.last_signal:
-    log_trade(symbol, price, ofi, signal, signal, reason)
-    st.session_state.last_signal = signal
+# Check 1: Order Flow
+if ofi > 0.15: score += 1; reasons.append("Aggressive Buying")
+elif ofi < -0.15: score -= 1; reasons.append("Aggressive Selling")
 
-# DISPLAY METRICS
-col1, col2, col3 = st.columns(3)
-col1.metric("Price", f"${price:,.2f}")
-col2.metric("OFI Pressure", f"{ofi:.3f}")
+# Check 2: RSI
+if 40 < rsi < 70: 
+    if score > 0: score += 1
+    elif score < 0: score -= 1
+else: reasons.append(f"RSI Risky ({rsi:.0f})")
 
-color = "white"
-if signal == "BUY": color = "#00FF00"
-if signal == "SELL": color = "#FF0000"
-col3.markdown(f"**Signal:** <span style='color:{color}'>{signal}</span>", unsafe_allow_html=True)
+# Check 3: VWAP
+if price > vwap: 
+    if score > 0: score += 1
+    reasons.append("Uptrend (Above VWAP)")
+else: 
+    if score < 0: score -= 1
+    reasons.append("Downtrend (Below VWAP)")
+
+# Final Verdict
+if score >= 3: signal = "PERFECT BUY 🟢"
+elif score <= -3: signal = "PERFECT SELL 🔴"
+elif score > 0: signal = "WEAK BUY 🟡"
+elif score < 0: signal = "WEAK SELL 🟠"
+
+# --- VISUALS ---
+c1, c2, c3 = st.columns(3)
+c1.metric("Price", f"${price:,.2f}")
+c2.metric("OFI Pressure", f"{ofi:.3f}")
+c3.metric("RSI (14)", f"{rsi:.1f}")
 
 st.divider()
 
-# WALLS
-wc1, wc2 = st.columns(2)
-with wc1:
-    st.write("🛡️ **Support**")
-    walls = get_walls(bids, price)
-    if walls:
-        for w in walls: st.success(w)
-    else: st.info("No Walls")
-    
-with wc2:
-    st.write("⚔️ **Resistance**")
-    walls = get_walls(asks, price)
-    if walls:
-        for w in walls: st.error(w)
-    else: st.info("No Walls")
+# Split Layout: Signal Left, Risk Right
+sc1, sc2 = st.columns([1.5, 1])
 
-# --- LIVE LOG VIEWER (ALWAYS VISIBLE) ---
+with sc1:
+    st.subheader(f"🎯 Signal: {signal}")
+    st.write(f"**Confluence Score:** {abs(score)}/3 Checks")
+    for r in reasons: st.caption(f"• {r}")
+
+with sc2:
+    st.subheader("🎲 Risk Analysis")
+    if st.button("Run Simulation (24h)"):
+        with st.spinner("Simulating 1,000 Futures..."):
+            vol = get_real_volatility(symbol)
+            var_95 = run_monte_carlo(price, vol)
+            downside = price - var_95
+            
+            st.error(f"⚠️ Max Risk (VaR 95%): -${downside:,.2f}")
+            st.caption(f"Based on {vol*100:.2f}% Daily Volatility")
+            
+            # If Signal is Perfect, Auto-Log the trade
+            if "PERFECT" in signal:
+                log_trade(symbol, price, ofi, rsi, signal, f"-${downside:.2f}")
+                st.toast("✅ Trade & Risk Metrics Logged!")
+
+# Log Viewer
 st.divider()
-st.subheader("📝 Live Data Recorder")
-
-# Always read file because we force-created it at the top
-try:
+st.caption("📝 Trade Log")
+if os.path.exists(LOG_FILE):
     df = pd.read_csv(LOG_FILE)
     if not df.empty:
-        # Sort by time so newest is on top
-        df = df.sort_values(by="Timestamp", ascending=False)
-        st.dataframe(df.head(5), use_container_width=True)
-    else:
-        st.info("⏳ Waiting for first signal... (Table is empty)")
-except:
-    st.error("Error reading log file. Resetting...")
-    os.remove(LOG_FILE) # Nuke it if it's broken
+        st.dataframe(df.tail(3), use_container_width=True)
 
-# AUTO-REFRESH
-time.sleep(1) 
+# Auto-Refresh
+time.sleep(1)
 st.rerun()
