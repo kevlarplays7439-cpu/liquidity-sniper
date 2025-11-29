@@ -15,7 +15,6 @@ st.markdown("""
     .metric-card { background-color: #0E1117; padding: 15px; border-radius: 10px; border: 1px solid #333; }
     .stTabs [data-baseweb="tab-list"] { gap: 20px; }
     .stTabs [data-baseweb="tab-list"] button { font-size: 1.1rem; }
-    /* Remove top padding to make it look like an app */
     .block-container { padding-top: 2rem; }
     </style>
     """, unsafe_allow_html=True)
@@ -104,8 +103,8 @@ def get_walls(orders, price):
 def plot_professional_chart(df, vwap_series, rsi_series, symbol, stop_loss, buy_walls, sell_walls):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                         vertical_spacing=0.03, row_heights=[0.75, 0.25])
-
-    # Candlestick
+    
+    # Candle
     fig.add_trace(go.Candlestick(
         x=df['time'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
         name="Price", increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
@@ -117,12 +116,17 @@ def plot_professional_chart(df, vwap_series, rsi_series, symbol, stop_loss, buy_
     # Stop Loss
     fig.add_hline(y=stop_loss, line_dash="dot", line_color="#d500f9", row=1, col=1, annotation_text="VaR Risk")
 
+    # Walls
+    for p, v in buy_walls:
+        fig.add_hline(y=p, line_color="rgba(0, 255, 0, 0.3)", row=1, col=1)
+    for p, v in sell_walls:
+        fig.add_hline(y=p, line_color="rgba(255, 0, 0, 0.3)", row=1, col=1)
+
     # RSI
     fig.add_trace(go.Scatter(x=df['time'], y=rsi_series, mode='lines', name='RSI', line=dict(color='#7e57c2', width=1.5)), row=2, col=1)
     fig.add_hline(y=70, line_dash="dot", line_color="gray", row=2, col=1)
     fig.add_hline(y=30, line_dash="dot", line_color="gray", row=2, col=1)
 
-    # UIREVISION = THE FLICKER FIX
     fig.update_layout(
         template="plotly_dark", height=600, margin=dict(l=10, r=10, t=30, b=10),
         xaxis_rangeslider_visible=False,
@@ -133,8 +137,6 @@ def plot_professional_chart(df, vwap_series, rsi_series, symbol, stop_loss, buy_
     return fig
 
 # --- 6. APP STRUCTURE ---
-
-# SIDEBAR (Static - Does not refresh)
 st.sidebar.header("⚙️ Sniper Scope")
 sym_input = st.sidebar.text_input("Symbol", "BTC-USD").upper()
 MAP = {"GOLD": "PAXG-USD", "XAUUSD": "PAXG-USD", "BITCOIN": "BTC-USD"}
@@ -145,11 +147,9 @@ trade_size = st.sidebar.number_input("Trade Size ($)", value=90.0, step=10.0)
 
 st.title(f"🦅 {symbol} Command Center")
 
-# --- THE FRAGMENT (THE MAGIC FIX) ---
-# This decorator tells Streamlit: "Only reload THIS function every 1s"
+# --- FRAGMENT LOGIC (Run every 1s) ---
 @st.fragment(run_every=1)
 def live_dashboard():
-    # GET DATA
     book_data = get_orderbook(symbol)
     candle_data = get_candles(symbol, 300)
 
@@ -191,8 +191,9 @@ def live_dashboard():
         if score < 0: score -= 1
         reasons.append("Downtrend")
 
+    # --- FIX WAS HERE (INDENTATION) ---
     if score >= 3: signal = "PERFECT BUY 🟢"
-elif score <= -3: signal = "PERFECT SELL 🔴"
+    elif score <= -3: signal = "PERFECT SELL 🔴"
 
     # Risk
     vol = get_real_volatility(symbol)
@@ -206,7 +207,7 @@ elif score <= -3: signal = "PERFECT SELL 🔴"
         st.session_state.last_sig = signal
         st.toast("Trade Logged!")
 
-    # --- UI DISPLAY ---
+    # Display
     tab1, tab2 = st.tabs(["🚀 Dashboard", "📈 Pro Chart"])
 
     with tab1:
@@ -242,5 +243,5 @@ elif score <= -3: signal = "PERFECT SELL 🔴"
         rsi_series = calculate_indicators(candle_data)[2]
         st.plotly_chart(plot_professional_chart(candle_data, vwap_series, rsi_series, symbol, stop_loss_price, get_walls(bids, price), get_walls(asks, price)), use_container_width=True)
 
-# CALL THE MAIN FUNCTION ONCE
+# Run Loop
 live_dashboard()
