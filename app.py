@@ -13,17 +13,24 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. LOGGING ---
+# --- 2. LOGGING ENGINE (Fixed) ---
 LOG_FILE = "forward_test_logs.csv"
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "w") as f:
-        f.write("Timestamp,Symbol,Price,OFI_Pressure,Sentiment,Signal,Reason\n")
+
+# Function to ensure file exists
+def init_log_file():
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w") as f:
+            f.write("Timestamp,Symbol,Price,OFI_Pressure,Sentiment,Signal,Reason\n")
 
 def log_trade(symbol, price, ofi, sentiment, signal, reason):
+    init_log_file() # Double check file exists
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"{timestamp},{symbol},{price},{ofi:.4f},{sentiment},{signal},{reason}\n"
     with open(LOG_FILE, "a") as f:
         f.write(entry)
+
+# Initialize on Startup
+init_log_file()
 
 # --- 3. HELPER FUNCTIONS ---
 def clean_user_input(user_input):
@@ -61,36 +68,38 @@ def get_walls(orders, price):
             walls.append(f"${val/1000:.0f}k @ {p:.2f}")
     return walls[:3]
 
-# --- 4. SIDEBAR ---
+# --- 4. SIDEBAR SETTINGS ---
 st.sidebar.header("⚙️ Settings")
-# Use Session State to remember the symbol so it doesn't reset on every refresh
 if "symbol" not in st.session_state:
     st.session_state.symbol = "BTC-USD"
 
 raw_input = st.sidebar.text_input("Enter Symbol", st.session_state.symbol)
 symbol = clean_user_input(raw_input)
-st.session_state.symbol = raw_input # Save input
+st.session_state.symbol = raw_input 
 
 st.sidebar.markdown("---")
 st.sidebar.info(f"Tracking: {symbol}")
-st.sidebar.caption("✅ Auto-Refresh Active")
+
+# DEBUG BUTTON: Force a log entry
+if st.sidebar.button("🛠️ Test Log Entry"):
+    log_trade(symbol, 0, 0, "TEST", "TEST_SIGNAL", "Manual Check")
+    st.toast("Test Row Added!")
 
 # --- 5. MAIN APP ---
 st.title(f"🦅 Liquidity Sniper: {symbol}")
 
 # STATE MANAGEMENT
 if "last_signal" not in st.session_state:
-    st.session_state.last_signal = "NEUTRAL"
+    st.session_state.last_signal = "INIT"
 
-# FETCH DATA ONCE
+# FETCH DATA
 data = get_market_data(symbol)
 
 if not data or 'bids' not in data:
     st.error(f"❌ Waiting for data for {symbol}...")
     time.sleep(1)
-    st.rerun() # Try again immediately
+    st.rerun()
 
-# PARSE DATA
 bids = data['bids']
 asks = data['asks']
 price = float(bids[0][0])
@@ -106,7 +115,7 @@ elif ofi < -0.15:
     signal = "SELL"
     reason = "Aggressive Selling"
 
-# LOGGING
+# AUTO LOGGING
 if signal != st.session_state.last_signal:
     log_trade(symbol, price, ofi, signal, signal, reason)
     st.session_state.last_signal = signal
@@ -139,6 +148,23 @@ with wc2:
         for w in walls: st.error(w)
     else: st.info("No Walls")
 
-# --- 6. THE AUTO-REFRESH ENGINE ---
-time.sleep(1) # Wait 1 second
-st.rerun()    # Restart the script from the top
+# --- LIVE LOG VIEWER (ALWAYS VISIBLE) ---
+st.divider()
+st.subheader("📝 Live Data Recorder")
+
+# Always read file because we force-created it at the top
+try:
+    df = pd.read_csv(LOG_FILE)
+    if not df.empty:
+        # Sort by time so newest is on top
+        df = df.sort_values(by="Timestamp", ascending=False)
+        st.dataframe(df.head(5), use_container_width=True)
+    else:
+        st.info("⏳ Waiting for first signal... (Table is empty)")
+except:
+    st.error("Error reading log file. Resetting...")
+    os.remove(LOG_FILE) # Nuke it if it's broken
+
+# AUTO-REFRESH
+time.sleep(1) 
+st.rerun()
