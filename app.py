@@ -21,7 +21,6 @@ st.markdown("""
 def get_data_coinbase(symbol):
     """Good for Crypto (BTC-USD). Works on Cloud."""
     try:
-        # Auto-fix symbol for Coinbase (needs dash)
         if "-" not in symbol and "USD" not in symbol: symbol = f"{symbol}-USD"
         
         url = f"https://api.exchange.coinbase.com/products/{symbol}/candles?granularity=86400"
@@ -36,16 +35,23 @@ def get_data_coinbase(symbol):
 
 @st.cache_data(ttl=3600)
 def get_data_yahoo(symbol):
-    """Good for Stocks (NVDA), Forex (EURUSD=X), Gold (GC=F). May fail on Cloud."""
+    """Good for Stocks. May fail on Cloud."""
     try:
-        # Download 2 years of daily data
         df = yf.download(symbol, period="2y", interval="1d", progress=False)
         if df.empty: return None
         
-        # Normalize columns to match Coinbase format
         df = df.reset_index()
-        df = df[['Date', 'Close']]
-        df.columns = ['time', 'close'] # Rename to standard
+        # Handle MultiIndex columns if YF returns them
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+            
+        # Ensure we have the right columns
+        # YF usually returns 'Date' and 'Close'
+        if 'Date' in df.columns:
+            df = df.rename(columns={'Date': 'time', 'Close': 'close'})
+        
+        df = df[['time', 'close']]
+        df['time'] = pd.to_datetime(df['time']) # Ensure datetime
         return df
     except: return None
 
@@ -57,7 +63,6 @@ def normalize(series):
     return (series - min_val) / (max_val - min_val)
 
 def find_similar_patterns(df, lookback=30, top_k=3):
-    # Ensure we have enough data
     if len(df) < lookback + 20: return [], []
 
     current_pattern = df['close'].tail(lookback).values
@@ -67,7 +72,6 @@ def find_similar_patterns(df, lookback=30, top_k=3):
     prices = df['close'].values
     dates = df['time'].values
     
-    # Search History (Stop before the current pattern starts)
     history_len = len(prices) - lookback - 10 
     
     progress_bar = st.progress(0)
@@ -79,8 +83,6 @@ def find_similar_patterns(df, lookback=30, top_k=3):
         norm_candidate = normalize(candidate)
         
         if len(candidate) == len(norm_target):
-            # Speed optimization: Only check correlation if endpoints align roughly
-            # (Skipping this check for accuracy, using raw Pearson)
             correlation, _ = pearsonr(norm_target, norm_candidate)
             
             if correlation > 0.80:
@@ -104,12 +106,10 @@ def find_similar_patterns(df, lookback=30, top_k=3):
     progress_bar.empty()
     matches = sorted(matches, key=lambda x: x['correlation'], reverse=True)
     
-    # Filter duplicates (overlapping dates)
     unique_matches = []
     seen_dates = set()
     for m in matches:
-        # Simple date check to avoid same week matches
-        d_str = str(m['date'])[:7] # Year-Month
+        d_str = str(m['date'])[:7] 
         if d_str not in seen_dates:
             unique_matches.append(m)
             seen_dates.add(d_str)
@@ -120,21 +120,20 @@ def find_similar_patterns(df, lookback=30, top_k=3):
 def plot_fractal(current_pattern, match_data):
     fig = go.Figure()
     
-    # Normalize inputs for visual comparison
     combined = np.concatenate([current_pattern, match_data['pattern'], match_data['future']])
     norm_factor = (np.max(combined) - np.min(combined))
     base = np.min(combined)
     def norm(arr): return (arr - base) / norm_factor
 
-    # Current Market (Green)
+    # Convert match date safely
+    safe_date = pd.to_datetime(match_data['date']).strftime('%Y')
+
     fig.add_trace(go.Scatter(x=list(range(len(current_pattern))), y=norm(current_pattern),
                              mode='lines', name='Current Market', line=dict(color='#00FF00', width=4)))
     
-    # Historical Match (Grey)
     fig.add_trace(go.Scatter(x=list(range(len(match_data['pattern']))), y=norm(match_data['pattern']),
-                             mode='lines', name=f"History ({match_data['date'].strftime('%Y')})", line=dict(color='gray', width=2, dash='dot')))
+                             mode='lines', name=f"History ({safe_date})", line=dict(color='gray', width=2, dash='dot')))
     
-    # Future Outcome (Red/Green)
     outcome_color = "#00c853" if match_data['outcome_pct'] > 0 else "#d50000"
     start_x = len(current_pattern) - 1
     future_x = list(range(start_x, start_x + len(match_data['future'])))
@@ -150,7 +149,6 @@ def plot_fractal(current_pattern, match_data):
 # --- 4. MAIN APP ---
 st.sidebar.header("⏳ FractalSearch")
 
-# DATA SOURCE SELECTOR
 data_source = st.sidebar.radio("Data Source", ["Coinbase (Crypto Only)", "Yahoo Finance (Stocks/Forex)"])
 
 if "Coinbase" in data_source:
@@ -180,7 +178,6 @@ if st.button("🚀 Scan History"):
         if not matches:
             st.warning("No clear fractal matches found. Try a different timeframe.")
         else:
-            # Stats
             avg_return = np.mean([m['outcome_pct'] for m in matches])
             win_rate = sum(1 for m in matches if m['outcome_pct'] > 0) / len(matches) * 100
             
@@ -192,7 +189,11 @@ if st.button("🚀 Scan History"):
             st.divider()
             
             for i, m in enumerate(matches):
-                st.subheader(f"Match #{i+1}: {m['date'].strftime('%d %b %Y')}")
+                # --- BUG FIX WAS HERE ---
+                # We wrap the date in pd.to_datetime() so it always has strftime
+                safe_date_str = pd.to_datetime(m['date']).strftime('%d %b %Y')
+                
+                st.subheader(f"Match #{i+1}: {safe_date_str}")
                 st.plotly_chart(plot_fractal(current, m), use_container_width=True)
                 with st.expander("Details"):
                     st.write(f"Similarity Score: {m['correlation']*100:.1f}%")
