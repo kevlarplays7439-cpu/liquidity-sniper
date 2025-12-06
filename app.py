@@ -1,210 +1,195 @@
 import streamlit as st
-import requests
-import time
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime
-from scipy.signal import argrelextrema
-import os
+from scipy.stats import pearsonr
+import time
 
-# --- 1. CONFIG & CSS (THE BEAUTY TREATMENT) ---
-st.set_page_config(page_title="Liquidity Sniper Pro", page_icon="🦅", layout="wide")
+# --- CONFIG ---
+st.set_page_config(page_title="FractalSearch Engine", page_icon="⏳", layout="wide")
 st.markdown("""
     <style>
-    /* Global Clean Look */
-    .block-container { padding-top: 1rem; max-width: 95%; }
-    
-    /* Card Styling */
-    .stContainer {
-        background-color: #1e222d;
-        border: 1px solid #2a2e39;
-        border-radius: 10px;
-        padding: 20px;
-        margin-bottom: 20px;
-    }
-    
-    /* Metric Styling */
-    [data-testid="stMetricValue"] {
-        font-size: 1.8rem;
-        font-family: 'Roboto Mono', monospace;
-    }
-    
-    /* Green/Red Tags */
-    .signal-box {
-        padding: 15px;
-        border-radius: 8px;
-        text-align: center;
-        font-weight: bold;
-        font-size: 1.5rem;
-        margin-bottom: 10px;
-    }
+    .metric-card { background-color: #0E1117; padding: 15px; border-radius: 10px; border: 1px solid #333; }
+    .block-container { padding-top: 2rem; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. LOGGING ---
-LOG_FILE = "sniper_logs.csv"
-def init_log():
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w") as f:
-            f.write("Time,Symbol,Price,Signal,Risk_SL\n")
-
-def log_trade(symbol, price, signal, risk_sl):
-    init_log()
-    ts = datetime.now().strftime("%H:%M:%S")
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{ts},{symbol},{price},{signal},{risk_sl}\n")
-
-init_log()
-
-# --- 3. DATA ENGINE ---
-def fetch_data(sym):
+# --- 1. DATA ENGINE ---
+@st.cache_data(ttl=3600) # Cache for 1 hour to speed up searching
+def get_historical_data(symbol, period="2y", interval="1h"):
+    """Fetches long-term history to search through."""
     try:
-        headers = {"User-Agent": "LiquidityLens/1.0"}
-        candles = requests.get(f"https://api.exchange.coinbase.com/products/{sym}/candles?granularity=60", headers=headers, timeout=2).json()
-        book = requests.get(f"https://api.exchange.coinbase.com/products/{sym}/book?level=2", headers=headers, timeout=2).json()
-        return book, candles
-    except: return None, None
+        df = yf.download(symbol, period=period, interval=interval, progress=False)
+        if df.empty: return None
+        # Clean data
+        df = df[['Close']].reset_index()
+        df.columns = ['time', 'close']
+        return df
+    except: return None
 
-# --- 4. MATH ENGINE ---
-def analyze_market(book_res, candle_res):
-    if not book_res or not candle_res: return None
+# --- 2. MATH ENGINE (PATTERN MATCHING) ---
+def normalize(series):
+    """Normalizes price data to a 0-1 scale so $20k BTC can match $90k BTC."""
+    min_val = np.min(series)
+    max_val = np.max(series)
+    if max_val - min_val == 0: return series
+    return (series - min_val) / (max_val - min_val)
+
+def find_similar_patterns(df, lookback=50, top_k=3):
+    """
+    The Core Algo: Scans history for patterns similar to the current one.
+    """
+    # 1. Get the Current Pattern (The Target)
+    current_pattern = df['close'].tail(lookback).values
+    norm_target = normalize(current_pattern)
     
-    # Data Prep
-    df = pd.DataFrame(candle_res, columns=["time", "low", "high", "open", "close", "vol"])
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    df = df.sort_values("time").reset_index(drop=True)
+    matches = []
+    prices = df['close'].values
+    dates = df['time'].values
     
-    bids = book_res['bids']
-    asks = book_res['asks']
-    price = float(bids[0][0])
-    last_idx = df.index[-1]
-    df.at[last_idx, 'close'] = price
+    # 2. Sliding Window Search (Scan history)
+    # We stop 'lookback' steps before the end to avoid matching with itself
+    history_len = len(prices) - lookback * 2 
     
-    # Indicators
-    df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    df['tp'] = (df['high'] + df['low'] + df['close']) / 3
-    df['pv'] = df['tp'] * df['vol']
-    df['vwap'] = df['pv'].cumsum() / df['vol'].cumsum()
+    progress_bar = st.progress(0)
+    
+    # Scan every window
+    for i in range(0, history_len):
+        # Update progress bar every 10%
+        if i % (history_len // 10) == 0: progress_bar.progress(i / history_len)
+            
+        # Extract candidate pattern
+        candidate = prices[i : i + lookback]
+        norm_candidate = normalize(candidate)
+        
+        # Calculate Similarity (Pearson Correlation)
+        # 1.0 = Identical, 0.0 = Random, -1.0 = Inverse
+        correlation, _ = pearsonr(norm_target, norm_candidate)
+        
+        # If highly similar, store it
+        if correlation > 0.80:
+            # Check what happened NEXT (The Future)
+            # We look 20 candles into the future from that point
+            future_start = i + lookback
+            future_end = i + lookback + 20
+            
+            if future_end < len(prices):
+                future_outcome = prices[future_start : future_end]
+                
+                # Calculate profit/loss of that future
+                entry = prices[future_start-1]
+                exit = prices[future_end-1]
+                pct_change = ((exit - entry) / entry) * 100
+                
+                matches.append({
+                    "date": dates[i],
+                    "correlation": correlation,
+                    "pattern": candidate,
+                    "future": future_outcome,
+                    "outcome_pct": pct_change,
+                    "start_idx": i
+                })
+    
+    progress_bar.empty()
+    
+    # 3. Sort by highest similarity
+    matches = sorted(matches, key=lambda x: x['correlation'], reverse=True)
+    return matches[:top_k], current_pattern
 
-    # OFI
-    b_vol = sum([float(x[1]) for x in bids])
-    a_vol = sum([float(x[1]) for x in asks])
-    ofi = (b_vol - a_vol) / (b_vol + a_vol) if (b_vol+a_vol) > 0 else 0
-
-    # Volatility & Risk
-    returns = df['close'].pct_change().dropna()
-    vol_1min = returns.std()
-    vol_hour = vol_1min * np.sqrt(60)
-    daily_return = np.random.normal(0, vol_hour, 2000)
-    future_prices = price * (1 + daily_return)
-    stop_loss = np.percentile(np.sort(future_prices), 5)
-
-    return {
-        "price": price, "df": df, "ofi": ofi, "stop_loss": stop_loss,
-        "rsi": df['rsi'].iloc[-1], "vwap": df['vwap'].iloc[-1], "ema": df['ema_50'].iloc[-1],
-        "bids": bids, "asks": asks
-    }
-
-# --- 5. CHART ENGINE ---
-def plot_chart(data):
-    df = data['df']
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.75, 0.25])
-    fig.add_trace(go.Candlestick(x=df['time'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price", increasing_line_color='#26a69a', decreasing_line_color='#ef5350'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['vwap'], line=dict(color='#ff9800', width=2), name="VWAP"), row=1, col=1)
-    fig.add_hline(y=data['stop_loss'], line_dash="dot", line_color="#d500f9", annotation_text="VaR Risk", row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['rsi'], line=dict(color='#7e57c2', width=1.5), name="RSI"), row=2, col=1)
-    fig.add_hline(y=70, line=dict(color="gray", dash="dot"), row=2, col=1)
-    fig.add_hline(y=30, line=dict(color="gray", dash="dot"), row=2, col=1)
-    fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False, uirevision='TheTruth')
+# --- 3. CHART ENGINE ---
+def plot_fractal(current_pattern, match_data):
+    fig = go.Figure()
+    
+    # A. Current Market (The "Now")
+    x_current = list(range(len(current_pattern)))
+    norm_curr = normalize(current_pattern)
+    
+    fig.add_trace(go.Scatter(
+        x=x_current, y=norm_curr,
+        mode='lines', name='Current Market',
+        line=dict(color='#00FF00', width=3)
+    ))
+    
+    # B. Historical Match (The "Past")
+    match_pattern = match_data['pattern']
+    future_pattern = match_data['future']
+    full_sequence = np.concatenate([match_pattern, future_pattern])
+    
+    # Normalize historical match to fit the same visual scale
+    norm_hist = normalize(full_sequence)
+    
+    # Split into "Pattern" (Solid) and "Future" (Dotted)
+    x_hist = list(range(len(norm_hist)))
+    
+    # The Pattern that matched
+    fig.add_trace(go.Scatter(
+        x=x_hist[:len(match_pattern)], 
+        y=norm_hist[:len(match_pattern)],
+        mode='lines', name=f"History ({match_data['date'].strftime('%Y-%m-%d')})",
+        line=dict(color='gray', width=2, dash='dot')
+    ))
+    
+    # The Future (What happened next)
+    outcome_color = "#00c853" if match_data['outcome_pct'] > 0 else "#d50000"
+    fig.add_trace(go.Scatter(
+        x=x_hist[len(match_pattern)-1:], 
+        y=norm_hist[len(match_pattern)-1:],
+        mode='lines', name=f"Outcome ({match_data['outcome_pct']:.2f}%)",
+        line=dict(color=outcome_color, width=3)
+    ))
+    
+    fig.add_vline(x=len(current_pattern)-1, line_dash="dash", annotation_text="TODAY")
+    
+    fig.update_layout(
+        template="plotly_dark", 
+        title=f"Fractal Match: {match_data['correlation']*100:.1f}% Similarity",
+        height=400, margin=dict(l=0, r=0, t=30, b=0),
+        xaxis_title="Time (Candles)", yaxis_title="Normalized Price (Shape)",
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+    )
     return fig
 
-# --- 6. MAIN APP ---
-st.sidebar.header("⚙️ Sniper Scope")
-sym = st.sidebar.text_input("Symbol", "BTC-USD").upper()
-if "-" not in sym and len(sym)>3: sym = f"{sym[:-3]}-{sym[-3:]}"
-trade_size = st.sidebar.number_input("Trade Size ($)", value=90.0, step=10.0)
+# --- 4. APP UI ---
+st.sidebar.header("⏳ FractalSearch")
+symbol = st.sidebar.text_input("Symbol", "BTC-USD").upper()
+lookback = st.sidebar.slider("Pattern Length (Candles)", 30, 100, 50)
+st.sidebar.caption("Scans last 2 Years of Hourly Data")
 
-if st.sidebar.button("🛠️ Test Log"):
-    log_trade(sym, 0, "TEST", "$0.00")
-    st.toast("Row Added")
+st.title(f"🔍 {symbol} Pattern Recognition Engine")
+st.caption("Finds historical moments that look exactly like today to predict tomorrow.")
 
-st.title(f"🦅 {sym} Terminal")
-
-@st.fragment(run_every=1)
-def main_loop():
-    book, candle = fetch_data(sym)
-    data = analyze_market(book, candle)
-    if not data:
-        st.caption("📡 Connecting...")
-        return
-
-    # Signal Logic
-    score = 0
-    if data['price'] > data['ema']: score += 1
-    else: score -= 1
-    if data['ofi'] > 0.15: score += 1
-    elif data['ofi'] < -0.15: score -= 1
-    if 40 < data['rsi'] < 60: pass # Neutral
-    elif data['rsi'] >= 60: score += 1
-    elif data['rsi'] <= 40: score -= 1
-
-    signal = "WAIT"
-    sig_color = "#555" # Grey
-    if score >= 3: 
-        signal = "STRONG BUY"
-        sig_color = "#00c853" # Green
-    elif score <= -3: 
-        signal = "STRONG SELL"
-        sig_color = "#d50000" # Red
-
-    # Risk Calc
-    dollar_risk = trade_size * ((data['price'] - data['stop_loss']) / data['price'])
-
-    # Auto Log
-    if "STRONG" in signal and signal != st.session_state.get('last_sig', ''):
-        log_trade(sym, data['price'], signal, f"${data['stop_loss']:.2f}")
-        st.session_state.last_sig = signal
-        st.toast(f"Signal: {signal}")
-
-    # --- NEW CLEAN LAYOUT ---
+# Main Execution
+if st.button("🚀 Scan History"):
+    with st.spinner(f"Downloading 2 years of {symbol} data..."):
+        df = get_historical_data(symbol)
     
-    # 1. Top Metrics (Minimal)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Price", f"${data['price']:,.2f}")
-    c2.metric("OFI Flow", f"{data['ofi']:.3f}")
-    c3.metric("RSI", f"{data['rsi']:.1f}")
-
-    # 2. Decision Engine (The Cards)
-    c_sig, c_risk = st.columns([2, 1])
-    
-    with c_sig:
-        st.markdown(f"""
-        <div class="signal-box" style="background-color: {sig_color}; color: white;">
-            {signal}
-        </div>
-        """, unsafe_allow_html=True)
-        st.caption(f"Confluence Score: {score}/3")
-
-    with c_risk:
-        with st.container(border=True):
-            st.markdown("**Risk Monitor**")
-            st.write(f"Stop Loss: **${data['stop_loss']:,.2f}**")
-            risk_color = "red" if dollar_risk > (trade_size * 0.02) else "green"
-            st.markdown(f"Risk: <span style='color:{risk_color}'>-${dollar_risk:.2f}</span>", unsafe_allow_html=True)
-
-    # 3. The Chart (Clean)
-    st.plotly_chart(plot_chart(data), use_container_width=True)
-
-    # 4. Hidden Log (The Drawer)
-    with st.expander("📝 Trade History"):
-        if os.path.exists(LOG_FILE):
-            st.dataframe(pd.read_csv(LOG_FILE).tail(5), use_container_width=True, hide_index=True)
-
-main_loop()
+    if df is not None:
+        with st.spinner(f"Scanning {len(df)} historical candles for matches..."):
+            matches, current_pattern = find_similar_patterns(df, lookback=lookback)
+        
+        if not matches:
+            st.warning("No high-confidence matches found. Try reducing pattern length.")
+        else:
+            # SUMMARY STATISTICS
+            bullish_count = sum(1 for m in matches if m['outcome_pct'] > 0)
+            avg_outcome = np.mean([m['outcome_pct'] for m in matches])
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Top Matches Found", len(matches))
+            col2.metric("Bullish Probability", f"{bullish_count/len(matches)*100:.0f}%")
+            col3.metric("Avg Predicted Move", f"{avg_outcome:+.2f}%", 
+                        delta_color="normal" if avg_outcome > 0 else "inverse")
+            
+            st.divider()
+            
+            # SHOW MATCHES
+            for i, match in enumerate(matches):
+                st.subheader(f"#{i+1} Match: {match['date'].strftime('%d %b %Y')}")
+                st.plotly_chart(plot_fractal(current_pattern, match), use_container_width=True)
+                
+                with st.expander("See Data Details"):
+                    st.write(f"**Correlation:** {match['correlation']:.4f}")
+                    st.write(f"**What happened next:** Price moved {match['outcome_pct']:.2f}% in the following 20 hours.")
+    else:
+        st.error("Could not fetch data. Check symbol.")
