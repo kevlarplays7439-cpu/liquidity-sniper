@@ -19,7 +19,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- 1. DATA ENGINES ---
-@st.cache_data(ttl=60) # Cache orderbook briefly
+@st.cache_data(ttl=60)
 def get_live_book(symbol):
     try:
         if "-" not in symbol and "USD" not in symbol: symbol = f"{symbol}-USD"
@@ -28,10 +28,9 @@ def get_live_book(symbol):
         return book
     except: return None
 
-@st.cache_data(ttl=3600) # Cache history for 1 hour
+@st.cache_data(ttl=3600)
 def get_long_term_data(symbol):
     try:
-        # Yahoo Finance for 2 Years of Hourly Data
         yf_sym = f"{symbol}-USD" if "USD" not in symbol else symbol
         if "BTC" in symbol: yf_sym = "BTC-USD"
         
@@ -64,23 +63,26 @@ def find_patterns(df, lookback=30):
     norm_target = normalize(current_pattern)
     
     matches = []
-    scan_len = min(len(prices) - lookback - 10, 5000) # Limit scan for speed
+    # Limit scan to recent history for speed (last 4000 candles)
+    scan_len = min(len(prices) - lookback - 10, 4000) 
     start_idx = len(prices) - scan_len - lookback - 10
     
-    # Progress Bar
+    # Check if start_idx is valid
+    if start_idx < 0: start_idx = 0
+
     prog_bar = st.progress(0)
-    step = scan_len // 50
+    step = max(1, scan_len // 50)
     
     for i in range(start_idx, len(prices) - lookback - 10):
-        if i % step == 0: prog_bar.progress((i - start_idx) / scan_len)
+        if i % step == 0: prog_bar.progress(min((i - start_idx) / scan_len, 1.0))
             
         candidate = prices[i : i + lookback]
         if len(candidate) == len(norm_target):
-            # Pre-filter: Check if start/end direction matches (Optimization)
+            # Pre-filter for speed
             if (candidate[-1] > candidate[0]) == (current_pattern[-1] > current_pattern[0]):
                 corr, _ = pearsonr(norm_target, normalize(candidate))
                 if corr > 0.85:
-                    future = prices[i+lookback : i+lookback+12] # 12 Hours ahead
+                    future = prices[i+lookback : i+lookback+12]
                     pct = ((future[-1] - prices[i+lookback-1]) / prices[i+lookback-1]) * 100
                     matches.append({
                         "date": dates[i], "corr": corr, "pattern": candidate, 
@@ -92,38 +94,42 @@ def find_patterns(df, lookback=30):
 
 def get_walls(book, current_price):
     if not book: return [], []
-    bids = book['bids']
-    asks = book['asks']
-    
-    buy_walls = []
-    sell_walls = []
-    
-    # Threshold: Dynamic based on price (approx $500k wall)
-    threshold = 50000 
-    
-    for p, s, _ in bids:
-        val = float(p) * float(s)
-        if val > threshold: buy_walls.append((float(p), val))
-            
-    for p, s, _ in asks:
-        val = float(p) * float(s)
-        if val > threshold: sell_walls.append((float(p), val))
+    try:
+        bids = book['bids']
+        asks = book['asks']
         
-    return buy_walls[:3], sell_walls[:3]
+        buy_walls = []
+        sell_walls = []
+        threshold = 50000 
+        
+        for p, s, _ in bids:
+            val = float(p) * float(s)
+            if val > threshold: buy_walls.append((float(p), val))
+                
+        for p, s, _ in asks:
+            val = float(p) * float(s)
+            if val > threshold: sell_walls.append((float(p), val))
+            
+        return buy_walls[:3], sell_walls[:3]
+    except: return [], []
 
+# --- FIXED RISK FUNCTION (RETURNING 3 VALUES NOW) ---
 def run_risk(current_price, df_hist):
     returns = df_hist['close'].pct_change().dropna()
-    vol = returns.std() * np.sqrt(24) # Daily Vol
-    sims = np.random.normal(0, vol * np.sqrt(7), 5000) # 7 Day Risk
+    vol = returns.std() * np.sqrt(24) # Daily Volatility
+    sims = np.random.normal(0, vol * np.sqrt(7), 5000) # 7 Day Horizon
     futures = current_price * (1 + sims)
-    return np.percentile(futures, 5), np.percentile(futures, 95)
+    
+    var_95 = np.percentile(futures, 5)
+    upside_95 = np.percentile(futures, 95)
+    
+    # BUG FIX: Now returning 3 values (Risk, Upside, Volatility)
+    return var_95, upside_95, vol
 
 # --- 3. CHART ENGINE ---
 def plot_combo_chart(current_pattern, match, buy_walls, sell_walls):
     fig = go.Figure()
     
-    # 1. Normalize History to match Current Price Levels
-    # We essentially "drag" the historical pattern to overlay on today's price
     curr_start = current_pattern[0]
     hist_start = match['pattern'][0]
     scaler = curr_start / hist_start
@@ -131,29 +137,21 @@ def plot_combo_chart(current_pattern, match, buy_walls, sell_walls):
     scaled_hist = match['pattern'] * scaler
     scaled_future = match['future'] * scaler
     
-    # X-Axis
     x_curr = list(range(len(current_pattern)))
     x_fut = list(range(len(current_pattern), len(current_pattern) + len(scaled_future)))
     
-    # Plot Current (Solid Green)
     fig.add_trace(go.Scatter(x=x_curr, y=current_pattern, mode='lines', name='Price Now', line=dict(color='#00FF00', width=3)))
+    fig.add_trace(go.Scatter(x=x_curr, y=scaled_hist, mode='lines', name=f"Fractal ({pd.to_datetime(match['date']).strftime('%Y')})", line=dict(color='gray', width=2, dash='dot')))
     
-    # Plot History (Dotted Grey)
-    fig.add_trace(go.Scatter(x=x_curr, y=scaled_hist, mode='lines', name=f"Fractal ({match['date'].strftime('%Y')})", line=dict(color='gray', width=2, dash='dot')))
-    
-    # Plot Future Projection (Colored)
     color = "#00c853" if match['pct'] > 0 else "#d50000"
     fig.add_trace(go.Scatter(x=x_fut, y=scaled_future, mode='lines', name='Projection', line=dict(color=color, width=3)))
     
-    # --- LIQUIDITY WALLS (NEW) ---
-    # We only show walls within reasonable range of the chart
     y_min, y_max = min(current_pattern), max(current_pattern)
     range_span = y_max - y_min
     
     for p, v in buy_walls:
         if y_min - range_span < p < y_max + range_span:
             fig.add_hline(y=p, line_color="rgba(0, 255, 0, 0.5)", annotation_text=f"🐳 Buy ${v/1000:.0f}k")
-            
     for p, v in sell_walls:
         if y_min - range_span < p < y_max + range_span:
             fig.add_hline(y=p, line_color="rgba(255, 0, 0, 0.5)", annotation_text=f"🐳 Sell ${v/1000:.0f}k", annotation_position="top right")
@@ -179,7 +177,6 @@ if "-" not in sym: sym += "-USD"
 st.title(f"🔍 {sym} Market Intelligence")
 
 if st.button("🚀 Analyze Market"):
-    # 1. Fetch
     df_hist = None
     book = None
     with st.spinner("Downloading History & Orderbook..."):
@@ -187,19 +184,18 @@ if st.button("🚀 Analyze Market"):
         book = get_live_book(sym)
         
     if df_hist is not None and book is not None:
-        # 2. Analyze
         matches, current = find_patterns(df_hist)
         buy_walls, sell_walls = get_walls(book, current[-1])
-        var_95, upside, _ = run_risk(current[-1], df_hist)
         
-        # 3. Stats
+        # --- FIXED CALL ---
+        var_95, upside, vol = run_risk(current[-1], df_hist)
+        
         if matches:
             avg_move = np.mean([m['pct'] for m in matches])
             win_rate = sum(1 for m in matches if m['pct'] > 0) / len(matches) * 100
         else:
             avg_move, win_rate = 0, 0
 
-        # --- UI LAYOUT ---
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Current Price", f"${current[-1]:,.2f}")
         c2.metric("Hist. Win Rate", f"{win_rate:.0f}%")
@@ -208,14 +204,12 @@ if st.button("🚀 Analyze Market"):
         
         st.divider()
         
-        # TABS
         tab1, tab2, tab3 = st.tabs(["🔮 Pattern + Walls", "📅 Seasonality", "🎲 Risk"])
         
         with tab1:
             st.caption("Green/Red Lines = Real-Time Liquidity Walls (Whales)")
             st.caption("Dotted Line = Historical Pattern Match")
             if matches:
-                # Show Best Match
                 st.subheader(f"Best Match: {pd.to_datetime(matches[0]['date']).strftime('%Y-%m-%d')}")
                 st.plotly_chart(plot_combo_chart(current, matches[0], buy_walls, sell_walls), use_container_width=True)
             else:
@@ -226,7 +220,9 @@ if st.button("🚀 Analyze Market"):
             st.plotly_chart(plot_seasonality(df_hist), use_container_width=True)
             
         with tab3:
-            st.info(f"Based on 1 Year of Volatility, price has a 95% chance to stay between ${var_95:,.0f} and ${upside:,.0f} next week.")
+            st.info(f"Based on {vol*100:.2f}% Daily Volatility (1 Year History):")
+            st.success(f"Optimistic Target: ${upside:,.2f}")
+            st.error(f"Defensive Stop Loss: ${var_95:,.2f}")
 
     else:
         st.error("Data Error. Yahoo/Coinbase might be blocking. Try local run.")
