@@ -3,202 +3,230 @@ import requests
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from scipy.stats import pearsonr
 import yfinance as yf
 
 # --- CONFIG ---
-st.set_page_config(page_title="FractalSearch Engine", page_icon="⏳", layout="wide")
+st.set_page_config(page_title="Omni-Sniper Pro", page_icon="🦅", layout="wide")
 st.markdown("""
     <style>
     .metric-card { background-color: #0E1117; padding: 15px; border-radius: 10px; border: 1px solid #333; }
-    .block-container { padding-top: 2rem; }
+    .stTabs [data-baseweb="tab-list"] { gap: 20px; }
+    .stTabs [data-baseweb="tab-list"] button { font-size: 1.1rem; }
+    .block-container { padding-top: 1rem; }
     </style>
     """, unsafe_allow_html=True)
 
 # --- 1. DATA ENGINES ---
-@st.cache_data(ttl=3600)
-def get_data_coinbase(symbol):
+@st.cache_data(ttl=60) # Cache orderbook briefly
+def get_live_book(symbol):
     try:
         if "-" not in symbol and "USD" not in symbol: symbol = f"{symbol}-USD"
-        url = f"https://api.exchange.coinbase.com/products/{symbol}/candles?granularity=86400"
         headers = {"User-Agent": "FractalSearch/1.0"}
-        res = requests.get(url, headers=headers, timeout=5).json()
-        df = pd.DataFrame(res, columns=["time", "low", "high", "open", "close", "vol"])
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df = df.sort_values("time").reset_index(drop=True)
-        return df
+        book = requests.get(f"https://api.exchange.coinbase.com/products/{symbol}/book?level=2", headers=headers, timeout=2).json()
+        return book
     except: return None
 
-@st.cache_data(ttl=3600)
-def get_data_yahoo(symbol):
+@st.cache_data(ttl=3600) # Cache history for 1 hour
+def get_long_term_data(symbol):
     try:
-        df = yf.download(symbol, period="2y", interval="1d", progress=False)
+        # Yahoo Finance for 2 Years of Hourly Data
+        yf_sym = f"{symbol}-USD" if "USD" not in symbol else symbol
+        if "BTC" in symbol: yf_sym = "BTC-USD"
+        
+        df = yf.download(yf_sym, period="1y", interval="1h", progress=False)
         if df.empty: return None
+        
         df = df.reset_index()
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
-        if 'Date' in df.columns: df = df.rename(columns={'Date': 'time', 'Close': 'close'})
-        df = df[['time', 'close']]
-        df['time'] = pd.to_datetime(df['time'])
-        return df
+        mapper = {'Date': 'time', 'Datetime': 'time', 'Close': 'close', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Volume': 'vol'}
+        df = df.rename(columns=mapper)
+        
+        if 'time' not in df.columns and 'index' in df.columns: df['time'] = df['index']
+        df['time'] = pd.to_datetime(df['time'], utc=True)
+        return df[['time', 'close', 'vol']]
     except: return None
 
-# --- 2. MONTE CARLO ENGINE (NEW) ---
-def run_monte_carlo(current_price, df_history, simulations=2000, days_forward=10):
-    # Calculate daily volatility (Standard Deviation of returns)
-    returns = df_history['close'].pct_change().dropna()
-    daily_vol = returns.std()
-    
-    # Scale volatility for the forecast period (Square Root of Time Rule)
-    # If looking 10 days ahead, volatility is higher than 1 day ahead
-    period_vol = daily_vol * np.sqrt(days_forward)
-    
-    # Run Simulations
-    sim_returns = np.random.normal(0, period_vol, simulations)
-    future_prices = current_price * (1 + sim_returns)
-    future_prices = np.sort(future_prices)
-    
-    # 95% Confidence Interval (Value at Risk)
-    var_95_price = np.percentile(future_prices, 5)  # Worst case
-    upside_95_price = np.percentile(future_prices, 95) # Best case
-    
-    return var_95_price, upside_95_price, daily_vol
-
-# --- 3. PATTERN ENGINE ---
+# --- 2. MATH ENGINES ---
 def normalize(series):
     min_val = np.min(series)
     max_val = np.max(series)
     if max_val - min_val == 0: return series
     return (series - min_val) / (max_val - min_val)
 
-def find_similar_patterns(df, lookback=30, top_k=3):
-    if len(df) < lookback + 20: return [], []
-    current_pattern = df['close'].tail(lookback).values
-    norm_target = normalize(current_pattern)
-    matches = []
+def find_patterns(df, lookback=30):
+    if len(df) < lookback + 20: return [], df['close'].tail(lookback).values
+    
     prices = df['close'].values
     dates = df['time'].values
-    history_len = len(prices) - lookback - 10 
-    progress_bar = st.progress(0)
+    current_pattern = prices[-lookback:]
+    norm_target = normalize(current_pattern)
     
-    for i in range(0, history_len):
-        if i % 50 == 0: progress_bar.progress(i / history_len)
+    matches = []
+    scan_len = min(len(prices) - lookback - 10, 5000) # Limit scan for speed
+    start_idx = len(prices) - scan_len - lookback - 10
+    
+    # Progress Bar
+    prog_bar = st.progress(0)
+    step = scan_len // 50
+    
+    for i in range(start_idx, len(prices) - lookback - 10):
+        if i % step == 0: prog_bar.progress((i - start_idx) / scan_len)
+            
         candidate = prices[i : i + lookback]
         if len(candidate) == len(norm_target):
-            norm_candidate = normalize(candidate)
-            correlation, _ = pearsonr(norm_target, norm_candidate)
-            if correlation > 0.80:
-                future = prices[i + lookback : i + lookback + 10]
-                pct_change = ((future[-1] - prices[i + lookback-1]) / prices[i + lookback-1]) * 100
-                matches.append({
-                    "date": dates[i], "correlation": correlation,
-                    "pattern": candidate, "future": future, "outcome_pct": pct_change
-                })
+            # Pre-filter: Check if start/end direction matches (Optimization)
+            if (candidate[-1] > candidate[0]) == (current_pattern[-1] > current_pattern[0]):
+                corr, _ = pearsonr(norm_target, normalize(candidate))
+                if corr > 0.85:
+                    future = prices[i+lookback : i+lookback+12] # 12 Hours ahead
+                    pct = ((future[-1] - prices[i+lookback-1]) / prices[i+lookback-1]) * 100
+                    matches.append({
+                        "date": dates[i], "corr": corr, "pattern": candidate, 
+                        "future": future, "pct": pct
+                    })
     
-    progress_bar.empty()
-    matches = sorted(matches, key=lambda x: x['correlation'], reverse=True)
-    unique_matches = []
-    seen_dates = set()
-    for m in matches:
-        d_str = str(m['date'])[:7] 
-        if d_str not in seen_dates:
-            unique_matches.append(m)
-            seen_dates.add(d_str)
-    return unique_matches[:top_k], current_pattern
+    prog_bar.empty()
+    return sorted(matches, key=lambda x: x['corr'], reverse=True)[:3], current_pattern
 
-# --- 4. CHART ENGINE ---
-def plot_fractal(current_pattern, match_data):
+def get_walls(book, current_price):
+    if not book: return [], []
+    bids = book['bids']
+    asks = book['asks']
+    
+    buy_walls = []
+    sell_walls = []
+    
+    # Threshold: Dynamic based on price (approx $500k wall)
+    threshold = 50000 
+    
+    for p, s, _ in bids:
+        val = float(p) * float(s)
+        if val > threshold: buy_walls.append((float(p), val))
+            
+    for p, s, _ in asks:
+        val = float(p) * float(s)
+        if val > threshold: sell_walls.append((float(p), val))
+        
+    return buy_walls[:3], sell_walls[:3]
+
+def run_risk(current_price, df_hist):
+    returns = df_hist['close'].pct_change().dropna()
+    vol = returns.std() * np.sqrt(24) # Daily Vol
+    sims = np.random.normal(0, vol * np.sqrt(7), 5000) # 7 Day Risk
+    futures = current_price * (1 + sims)
+    return np.percentile(futures, 5), np.percentile(futures, 95)
+
+# --- 3. CHART ENGINE ---
+def plot_combo_chart(current_pattern, match, buy_walls, sell_walls):
     fig = go.Figure()
-    combined = np.concatenate([current_pattern, match_data['pattern'], match_data['future']])
-    norm_factor = (np.max(combined) - np.min(combined))
-    base = np.min(combined)
-    def norm(arr): return (arr - base) / norm_factor
-    safe_date = pd.to_datetime(match_data['date']).strftime('%Y')
+    
+    # 1. Normalize History to match Current Price Levels
+    # We essentially "drag" the historical pattern to overlay on today's price
+    curr_start = current_pattern[0]
+    hist_start = match['pattern'][0]
+    scaler = curr_start / hist_start
+    
+    scaled_hist = match['pattern'] * scaler
+    scaled_future = match['future'] * scaler
+    
+    # X-Axis
+    x_curr = list(range(len(current_pattern)))
+    x_fut = list(range(len(current_pattern), len(current_pattern) + len(scaled_future)))
+    
+    # Plot Current (Solid Green)
+    fig.add_trace(go.Scatter(x=x_curr, y=current_pattern, mode='lines', name='Price Now', line=dict(color='#00FF00', width=3)))
+    
+    # Plot History (Dotted Grey)
+    fig.add_trace(go.Scatter(x=x_curr, y=scaled_hist, mode='lines', name=f"Fractal ({match['date'].strftime('%Y')})", line=dict(color='gray', width=2, dash='dot')))
+    
+    # Plot Future Projection (Colored)
+    color = "#00c853" if match['pct'] > 0 else "#d50000"
+    fig.add_trace(go.Scatter(x=x_fut, y=scaled_future, mode='lines', name='Projection', line=dict(color=color, width=3)))
+    
+    # --- LIQUIDITY WALLS (NEW) ---
+    # We only show walls within reasonable range of the chart
+    y_min, y_max = min(current_pattern), max(current_pattern)
+    range_span = y_max - y_min
+    
+    for p, v in buy_walls:
+        if y_min - range_span < p < y_max + range_span:
+            fig.add_hline(y=p, line_color="rgba(0, 255, 0, 0.5)", annotation_text=f"🐳 Buy ${v/1000:.0f}k")
+            
+    for p, v in sell_walls:
+        if y_min - range_span < p < y_max + range_span:
+            fig.add_hline(y=p, line_color="rgba(255, 0, 0, 0.5)", annotation_text=f"🐳 Sell ${v/1000:.0f}k", annotation_position="top right")
 
-    fig.add_trace(go.Scatter(x=list(range(len(current_pattern))), y=norm(current_pattern),
-                             mode='lines', name='Current Market', line=dict(color='#00FF00', width=4)))
-    fig.add_trace(go.Scatter(x=list(range(len(match_data['pattern']))), y=norm(match_data['pattern']),
-                             mode='lines', name=f"History ({safe_date})", line=dict(color='gray', width=2, dash='dot')))
-    
-    outcome_color = "#00c853" if match_data['outcome_pct'] > 0 else "#d50000"
-    start_x = len(current_pattern) - 1
-    future_x = list(range(start_x, start_x + len(match_data['future'])))
-    
-    fig.add_trace(go.Scatter(x=future_x, y=norm(match_data['future']),
-                             mode='lines', name='Projected Move', line=dict(color=outcome_color, width=4)))
-    
-    fig.add_vline(x=len(current_pattern)-1, line_dash="dash", annotation_text="TODAY")
-    fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, t=30, b=0),
-                      xaxis_title="Days", yaxis_title="Normalized Price", hovermode="x")
+    fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=30, b=0), xaxis_title="Hours", yaxis_title="Price ($)")
     return fig
 
-# --- 5. MAIN APP ---
-st.sidebar.header("⏳ FractalSearch")
-data_source = st.sidebar.radio("Data Source", ["Coinbase (Crypto)", "Yahoo (Stocks)"])
-if "Coinbase" in data_source: sym_input = st.sidebar.text_input("Symbol", "BTC-USD").upper()
-else: sym_input = st.sidebar.text_input("Symbol", "NVDA").upper()
-lookback = st.sidebar.slider("Pattern Length", 14, 60, 30)
-st.sidebar.caption("Includes Monte Carlo Risk Check")
-
-st.title(f"🔍 {sym_input} Fractal + Monte Carlo")
-
-if st.button("🚀 Run Analysis"):
-    df = None
-    with st.spinner("Crunching data..."):
-        if "Coinbase" in data_source: df = get_data_coinbase(sym_input)
-        else: df = get_data_yahoo(sym_input)
+def plot_seasonality(df):
+    df['hour'] = df['time'].dt.hour
+    df['return'] = df['close'].pct_change()
+    stats = df.groupby('hour')['return'].mean() * 100
     
-    if df is not None:
-        # 1. RUN MONTE CARLO FIRST
-        current_price = df['close'].iloc[-1]
-        var_95, upside_95, vol = run_monte_carlo(current_price, df)
+    colors = ['#00c853' if v > 0 else '#d50000' for v in stats.values]
+    fig = go.Figure(go.Bar(x=stats.index, y=stats.values, marker_color=colors))
+    fig.update_layout(template="plotly_dark", title="Hourly Seasonality (UTC)", yaxis_title="Avg Return %", height=300)
+    return fig
+
+# --- 4. MAIN APP ---
+st.sidebar.header("🦅 Omni-Sniper")
+sym = st.sidebar.text_input("Symbol", "BTC").upper()
+if "-" not in sym: sym += "-USD"
+
+st.title(f"🔍 {sym} Market Intelligence")
+
+if st.button("🚀 Analyze Market"):
+    # 1. Fetch
+    df_hist = None
+    book = None
+    with st.spinner("Downloading History & Orderbook..."):
+        df_hist = get_long_term_data(sym)
+        book = get_live_book(sym)
         
-        # 2. RUN FRACTAL SEARCH
-        matches, current = find_similar_patterns(df, lookback=lookback)
+    if df_hist is not None and book is not None:
+        # 2. Analyze
+        matches, current = find_patterns(df_hist)
+        buy_walls, sell_walls = get_walls(book, current[-1])
+        var_95, upside, _ = run_risk(current[-1], df_hist)
         
-        # 3. DISPLAY RESULTS
-        # Top Stats Row
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Current Price", f"${current_price:,.2f}")
-        c2.metric("Daily Volatility", f"{vol*100:.2f}%")
-        
-        # Calculate Fractal Win Rate
+        # 3. Stats
         if matches:
-            win_rate = sum(1 for m in matches if m['outcome_pct'] > 0) / len(matches) * 100
-            c3.metric("Historical Win Rate", f"{win_rate:.0f}%")
+            avg_move = np.mean([m['pct'] for m in matches])
+            win_rate = sum(1 for m in matches if m['pct'] > 0) / len(matches) * 100
         else:
-            c3.metric("Matches Found", "0")
+            avg_move, win_rate = 0, 0
 
+        # --- UI LAYOUT ---
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Current Price", f"${current[-1]:,.2f}")
+        c2.metric("Hist. Win Rate", f"{win_rate:.0f}%")
+        c3.metric("Projected Move", f"{avg_move:+.2f}%", delta_color="normal" if avg_move > 0 else "inverse")
+        c4.metric("Risk (VaR 95)", f"${var_95:,.0f}")
+        
         st.divider()
         
-        # --- RISK ANALYSIS SECTION (NEW) ---
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            st.subheader("🎲 Monte Carlo Forecast (10 Days)")
-            st.write(f"Based on **{vol*100:.2f}%** volatility, here is the statistical range for the next 10 days:")
-            st.error(f"🛑 **Worst Case (VaR 95%):** ${var_95:,.2f}")
-            st.success(f"🚀 **Best Case (Upside 95%):** ${upside_95:,.2f}")
+        # TABS
+        tab1, tab2, tab3 = st.tabs(["🔮 Pattern + Walls", "📅 Seasonality", "🎲 Risk"])
         
-        with rc2:
-            st.subheader("🔮 Historical Precedent")
+        with tab1:
+            st.caption("Green/Red Lines = Real-Time Liquidity Walls (Whales)")
+            st.caption("Dotted Line = Historical Pattern Match")
             if matches:
-                avg_move = np.mean([m['outcome_pct'] for m in matches])
-                sentiment = "BULLISH" if avg_move > 0 else "BEARISH"
-                color = "green" if avg_move > 0 else "red"
-                st.markdown(f"History says: <span style='color:{color}; font-size:24px'>**{sentiment}**</span>", unsafe_allow_html=True)
-                st.write(f"Average move after this pattern: **{avg_move:+.2f}%**")
+                # Show Best Match
+                st.subheader(f"Best Match: {pd.to_datetime(matches[0]['date']).strftime('%Y-%m-%d')}")
+                st.plotly_chart(plot_combo_chart(current, matches[0], buy_walls, sell_walls), use_container_width=True)
             else:
-                st.info("No patterns found to form an opinion.")
+                st.warning("No patterns found.")
+                
+        with tab2:
+            st.subheader("Best Time to Trade")
+            st.plotly_chart(plot_seasonality(df_hist), use_container_width=True)
+            
+        with tab3:
+            st.info(f"Based on 1 Year of Volatility, price has a 95% chance to stay between ${var_95:,.0f} and ${upside:,.0f} next week.")
 
-        st.divider()
-        
-        # --- FRACTAL MATCHES ---
-        if matches:
-            for i, m in enumerate(matches):
-                safe_date = pd.to_datetime(m['date']).strftime('%d %b %Y')
-                st.subheader(f"Match #{i+1}: {safe_date}")
-                st.plotly_chart(plot_fractal(current, m), use_container_width=True)
-                with st.expander(f"Details for Match #{i+1}"):
-                    st.write(f"Correlation: {m['correlation']:.2f}")
-                    st.write(f"Result: {m['outcome_pct']:.2f}%")
     else:
-        st.error("Data Error. Try switching source.")
+        st.error("Data Error. Yahoo/Coinbase might be blocking. Try local run.")
