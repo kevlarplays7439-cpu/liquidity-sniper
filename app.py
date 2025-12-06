@@ -37,7 +37,7 @@ def log_trade(symbol, price, signal, tf, sl):
 
 init_log()
 
-# --- 3. DATA ENGINE ---
+# --- 3. DATA ENGINES (FIXED NAMES) ---
 @st.cache_data(ttl=60)
 def get_data(symbol, granularity):
     try:
@@ -48,22 +48,26 @@ def get_data(symbol, granularity):
     except: return None, None
 
 @st.cache_data(ttl=3600)
-def get_long_term_data(symbol):
+def get_long_term_seasonality(symbol):
+    """Fetches 2 Years of Hourly Data from Yahoo"""
     try:
         yf_sym = symbol if "USD" in symbol else f"{symbol}-USD"
         if "BTC" in symbol: yf_sym = "BTC-USD"
-        df = yf.download(yf_sym, period="2y", interval="1h", progress=False) # 2 Years Data
+        
+        df = yf.download(yf_sym, period="2y", interval="1h", progress=False)
         if df.empty: return None
+        
         df = df.reset_index()
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
         df = df.rename(columns={'Date': 'time', 'Datetime': 'time', 'Close': 'close'})
         if 'time' not in df.columns: df['time'] = df.index
+        
         df['time'] = pd.to_datetime(df['time'], utc=True)
-        df['time'] = df['time'].dt.tz_convert('Asia/Kolkata')
+        df['time'] = df['time'].dt.tz_convert('Asia/Kolkata') # IST Conversion
         return df[['time', 'close']]
     except: return None
 
-# --- 4. MATH ENGINE ---
+# --- 4. MATH ENGINES ---
 def process_data(book_res, candle_res):
     if not book_res or not candle_res: return None
     bids = book_res['bids']
@@ -89,15 +93,16 @@ def normalize(series):
 def find_patterns(df, lookback=30):
     prices = df['close'].values
     if len(prices) < lookback + 20: return [], prices
+    
     current_pattern = prices[-lookback:]
     norm_target = normalize(current_pattern)
     matches = []
     
-    # Scan entire valid history
+    # Scan history
     for i in range(len(prices) - lookback - 20):
         candidate = prices[i : i + lookback]
         if len(candidate) == lookback:
-            # OPTIMIZATION: Only calculate Pearson if trend matches direction
+            # Direction check optimization
             if (candidate[-1] > candidate[0]) == (current_pattern[-1] > current_pattern[0]):
                 corr, _ = pearsonr(norm_target, normalize(candidate))
                 if corr > 0.80:
@@ -111,7 +116,7 @@ def find_patterns(df, lookback=30):
                         "pct": pct
                     })
     
-    # REMOVED [:3] LIMIT. NOW RETURNS ALL.
+    # Return ALL matches sorted by correlation
     return sorted(matches, key=lambda x: x['corr'], reverse=True), current_pattern
 
 def calculate_simple_seasonality(df):
@@ -143,7 +148,7 @@ def get_walls(bids, asks, price):
         if float(p)*float(s) > threshold: walls_a.append((float(p), float(p)*float(s)))
     return walls_b[:3], walls_a[:3]
 
-# --- 5. CHARTS ---
+# --- 5. CHART ENGINE ---
 def plot_fractal_chart(current, match, buy_walls, sell_walls):
     fig = go.Figure()
     scaler = current[0] / match['pattern'][0]
@@ -187,11 +192,16 @@ st.title(f"🔍 {sym} Market Intelligence")
 if st.button("🚀 Analyze Market"):
     with st.spinner("Crunching Institutional Data..."):
         book_res, candle_res = get_data(sym, granularity)
+        # BUG FIX: Ensure we call the function with the right name
         df_season = get_long_term_seasonality(sym)
         
     if book_res and candle_res:
         df, price, bids, asks = process_data(book_res, candle_res)
-        matches, current = find_patterns(df)
+        
+        # Use season data for patterns if available (more history), otherwise use Coinbase data
+        search_df = df_season if df_season is not None else df
+        matches, current = find_patterns(search_df)
+        
         buy_walls, sell_walls = get_walls(bids, asks, price)
         var_95, upside, vol = run_risk(price, df, granularity/60)
         
@@ -219,25 +229,23 @@ if st.button("🚀 Analyze Market"):
         
         with tab1:
             if matches:
-                # 1. CHART THE BEST MATCH
+                # 1. CHART
                 match_date = matches[0]['date'].strftime('%Y-%m-%d %H:%M')
                 st.caption(f"Top Match Date: {match_date} IST")
                 st.plotly_chart(plot_fractal_chart(current, matches[0], buy_walls, sell_walls), use_container_width=True)
                 
-                # 2. SHOW ALL MATCHES TABLE
+                # 2. TABLE (DEEP HISTORY)
                 st.divider()
                 st.subheader(f"📜 All Historical Matches ({len(matches)} Found)")
                 
-                # Create a nice dataframe for display
                 match_data = []
                 for m in matches:
                     match_data.append({
                         "Date (IST)": m['date'].strftime('%Y-%m-%d %H:%M'),
-                        "Correlation (%)": f"{m['corr']*100:.1f}%",
-                        "Outcome (%)": f"{m['pct']:+.2f}%",
-                        "Trend": "UP 🟢" if m['pct'] > 0 else "DOWN 🔴"
+                        "Correlation": f"{m['corr']*100:.1f}%",
+                        "Outcome": f"{m['pct']:+.2f}%",
+                        "Trend": "🟢 UP" if m['pct'] > 0 else "🔴 DOWN"
                     })
-                
                 st.dataframe(pd.DataFrame(match_data), use_container_width=True, hide_index=True)
             else: st.warning("No clear history matches.")
                 
