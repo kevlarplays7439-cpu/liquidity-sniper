@@ -1,7 +1,10 @@
-streamlit>=1.37.0
-requests
+streamlit
 pandas
 numpy
 plotly
 scipy
+statsmodels
+scikit-learn
+tensorflow
+arch
 yfinance
