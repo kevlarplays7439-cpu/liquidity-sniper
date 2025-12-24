@@ -1,266 +1,268 @@
 import streamlit as st
-import requests
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import plotly.express as px
-from scipy.stats import pearsonr
+import plotly.graph_objects as go
 import yfinance as yf
-from datetime import datetime
-import os
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from scipy.optimize import minimize
+from statsmodels.tsa.arima.model import ARIMA
+from arch import arch_model
+import warnings
 
-# --- 1. CONFIG & PREMIUM CSS ---
-st.set_page_config(page_title="Omni-Sniper Pro", page_icon="🦅", layout="wide")
-st.markdown("""
-    <style>
-    .stApp { background-color: #050505; font-family: 'Roboto', sans-serif; }
-    div.css-1r6slb0.e1tzin5v2 { background-color: #111111; border: 1px solid #333; padding: 20px; border-radius: 12px; }
-    [data-testid="stMetricValue"] { font-size: 28px !important; color: #ffffff !important; font-weight: 700; }
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; background-color: #0e0e0e; padding: 10px; border-radius: 10px; }
-    .stTabs [aria-selected="true"] { background-color: #333 !important; color: #00c853 !important; border: 1px solid #00c853; }
-    .block-container { padding-top: 1rem; }
-    </style>
-    """, unsafe_allow_html=True)
+warnings.filterwarnings("ignore")
 
-# --- 2. LOGGING ---
-LOG_FILE = "sniper_logs.csv"
-def init_log():
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w") as f:
-            f.write("Time,Symbol,Price,Signal,Timeframe,StopLoss\n")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Gramdev Dynamic AI Dashboard", layout="wide")
 
-def log_trade(symbol, price, signal, tf, sl):
-    init_log()
-    ts = datetime.now().strftime("%H:%M:%S")
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{ts},{symbol},{price},{signal},{tf},{sl}\n")
+# --- 1. MAPPING & HELPERS ---
+TICKER_MAP = {
+    "Action": "ACE", "Bharat": "BEL", "Blue_Star": "BLUESTARCO", "Caplin": "CAPLIPOINT",
+    "C_D_S_L": "CDSL", "Dr_Lal": "LALPATHLAB", "Dynacons": "DYNPRO", "Dynamic": "DYCL",
+    "Frontier": "Frontier_Springs", "Ganesh": "GANESHHOU", "HDFC": "HDFCAMC",
+    "I_R_C_T_C": "IRCTC", "Indiamart": "INDIAMART", "Indo_Tech": "INDOTECH",
+    "J_B_Chem": "JBCHEPHARM", "Jai_Balaji": "JAIBALAJI", "Jyoti": "JYOTIRES",
+    "KNR": "KNRCON", "Kingfa": "KINGFA", "Kirl": "KIRLPNU", "Macpower": "MACPOWER",
+    "Master": "MASTERTR", "Mazagon": "MAZDOCK", "Monarch": "MONARCH", "Newgen": "NEWGEN",
+    "Polycab": "POLYCAB", "Prec": "PRECWIRE", "RRP": "RRP_Defense", "Radhika": "RADHIKAJWE",
+    "Schaeffler": "SCHAEFFLER", "Shakti": "SHAKTIPUMP", "Shanthi": "SHANTIGEAR",
+    "Sharda": "SHARDAMOTR", "Shilchar": "SHILCHAR", "Sika": "SIKA", "Solar": "SOLARINDS",
+    "Stylam": "STYLAMIND", "Swaraj": "SWARAJENG", "Tanfac": "Tanfac_Inds", "Tata": "TATAELXSI",
+    "Timex": "TIMEX", "Voltamp": "VOLTAMP", 
+    "BLS": "BLS", "Apar": "APARINDS", "Ashoka": "ASHOKA", "Astrazeneca": "ASTRAZEN", 
+    "BSE": "BSE", "Cams": "CAMS", "3B": "3B_Blackbio"
+}
 
-init_log()
+def normalize_ticker(name):
+    if name in TICKER_MAP.values(): return name
+    for key, value in TICKER_MAP.items():
+        if key.upper() in name.upper(): return value
+    return name
 
-# --- 3. DATA ENGINES (FIXED NAMES) ---
-@st.cache_data(ttl=60)
-def get_data(symbol, granularity):
+def fetch_live_data(existing_df, ticker, yahoo_symbol):
+    """
+    Fetches missing data from Yahoo Finance and appends it to the CSV data.
+    """
     try:
-        headers = {"User-Agent": "FractalSearch/1.0"}
-        candle_url = f"https://api.exchange.coinbase.com/products/{symbol}/candles?granularity={granularity}"
-        book_url = f"https://api.exchange.coinbase.com/products/{symbol}/book?level=2"
-        return requests.get(book_url, headers=headers, timeout=2).json(), requests.get(candle_url, headers=headers, timeout=2).json()
-    except: return None, None
+        # Find the last date in our static CSV
+        last_date = existing_df['Date'].max()
+        
+        # Download new data from last_date + 1 day
+        start_date = (last_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        new_data = yf.download(yahoo_symbol, start=start_date, progress=False)
+        
+        if not new_data.empty:
+            # Format new data to match our DataFrame
+            new_data = new_data.reset_index()
+            # Handle potential MultiIndex columns from yfinance
+            if isinstance(new_data.columns, pd.MultiIndex):
+                new_data.columns = new_data.columns.get_level_values(0)
+            
+            # Select and rename columns
+            new_data = new_data[['Date', 'Close', 'Open', 'High', 'Low', 'Volume']]
+            new_data['Ticker'] = ticker # Add ticker column
+            
+            # Ensure Date types match
+            new_data['Date'] = pd.to_datetime(new_data['Date'])
+            
+            # Combine
+            combined = pd.concat([existing_df, new_data], ignore_index=True)
+            return combined, len(new_data)
+        
+        return existing_df, 0
+    except Exception as e:
+        return existing_df, -1
 
-@st.cache_data(ttl=3600)
-def get_long_term_seasonality(symbol):
-    """Fetches 2 Years of Hourly Data from Yahoo"""
+# --- 2. LOAD DATA ---
+@st.cache_data
+def load_base_data():
     try:
-        yf_sym = symbol if "USD" in symbol else f"{symbol}-USD"
-        if "BTC" in symbol: yf_sym = "BTC-USD"
+        scores = pd.read_csv("scores.csv")
+        fund = pd.read_csv("fundamentals.csv")
+        price = pd.read_csv("price_data.csv")
         
-        df = yf.download(yf_sym, period="2y", interval="1h", progress=False)
-        if df.empty: return None
+        scores['Ticker'] = scores['Ticker'].apply(normalize_ticker)
+        fund['Ticker'] = fund['Ticker'].apply(normalize_ticker)
         
-        df = df.reset_index()
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
-        df = df.rename(columns={'Date': 'time', 'Datetime': 'time', 'Close': 'close'})
-        if 'time' not in df.columns: df['time'] = df.index
+        fund['Date'] = pd.to_datetime(fund['Date'])
+        price['Date'] = pd.to_datetime(price['Date'])
         
-        df['time'] = pd.to_datetime(df['time'], utc=True)
-        df['time'] = df['time'].dt.tz_convert('Asia/Kolkata') # IST Conversion
-        return df[['time', 'close']]
-    except: return None
-
-# --- 4. MATH ENGINES ---
-def process_data(book_res, candle_res):
-    if not book_res or not candle_res: return None
-    bids = book_res['bids']
-    asks = book_res['asks']
-    price = float(bids[0][0])
-    
-    df = pd.DataFrame(candle_res, columns=["time", "low", "high", "open", "close", "vol"])
-    df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-    df['time'] = df['time'].dt.tz_convert('Asia/Kolkata')
-    df = df.sort_values("time").reset_index(drop=True)
-    
-    last_idx = df.index[-1]
-    df.at[last_idx, 'close'] = price
-    
-    return df, price, bids, asks
-
-def normalize(series):
-    min_val = np.min(series)
-    max_val = np.max(series)
-    if max_val - min_val == 0: return series
-    return (series - min_val) / (max_val - min_val)
-
-def find_patterns(df, lookback=30):
-    prices = df['close'].values
-    if len(prices) < lookback + 20: return [], prices
-    
-    current_pattern = prices[-lookback:]
-    norm_target = normalize(current_pattern)
-    matches = []
-    
-    # Scan history
-    for i in range(len(prices) - lookback - 20):
-        candidate = prices[i : i + lookback]
-        if len(candidate) == lookback:
-            # Direction check optimization
-            if (candidate[-1] > candidate[0]) == (current_pattern[-1] > current_pattern[0]):
-                corr, _ = pearsonr(norm_target, normalize(candidate))
-                if corr > 0.80:
-                    future = prices[i+lookback : i+lookback+10]
-                    pct = ((future[-1] - prices[i+lookback-1]) / prices[i+lookback-1]) * 100
-                    matches.append({
-                        "date": df['time'].iloc[i], 
-                        "corr": corr, 
-                        "pattern": candidate, 
-                        "future": future, 
-                        "pct": pct
-                    })
-    
-    # Return ALL matches sorted by correlation
-    return sorted(matches, key=lambda x: x['corr'], reverse=True), current_pattern
-
-def calculate_simple_seasonality(df):
-    df['hour'] = df['time'].dt.hour
-    df['day'] = df['time'].dt.day_name()
-    df['return'] = df['close'].pct_change()
-    hour_stats = df.groupby('hour')['return'].mean() * 100
-    day_stats = df.groupby('day')['return'].mean() * 100
-    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-    day_stats = day_stats.reindex(days)
-    return hour_stats, day_stats
-
-def run_risk(current_price, df_hist, timeframe_mins):
-    returns = df_hist['close'].pct_change().dropna()
-    vol_per_candle = returns.std()
-    projection_candles = 60 if timeframe_mins < 60 else 10
-    sim_vol = vol_per_candle * np.sqrt(projection_candles)
-    sims = np.random.normal(0, sim_vol, 2000)
-    futures = current_price * (1 + sims)
-    return np.percentile(futures, 5), np.percentile(futures, 95), vol_per_candle
-
-def get_walls(bids, asks, price):
-    walls_b = []
-    walls_a = []
-    threshold = 50000 
-    for p, s, _ in bids:
-        if float(p)*float(s) > threshold: walls_b.append((float(p), float(p)*float(s)))
-    for p, s, _ in asks:
-        if float(p)*float(s) > threshold: walls_a.append((float(p), float(p)*float(s)))
-    return walls_b[:3], walls_a[:3]
-
-# --- 5. CHART ENGINE ---
-def plot_fractal_chart(current, match, buy_walls, sell_walls):
-    fig = go.Figure()
-    scaler = current[0] / match['pattern'][0]
-    hist_scaled = match['pattern'] * scaler
-    fut_scaled = match['future'] * scaler
-    x_curr = list(range(len(current)))
-    x_fut = list(range(len(current), len(current)+len(fut_scaled)))
-    
-    fig.add_trace(go.Scatter(x=x_curr, y=current, mode='lines', name='Now', line=dict(color='#00FF00', width=3)))
-    fig.add_trace(go.Scatter(x=x_curr, y=hist_scaled, mode='lines', name='History', line=dict(color='#555555', dash='dot')))
-    col = "#00c853" if match['pct'] > 0 else "#d50000"
-    fig.add_trace(go.Scatter(x=x_fut, y=fut_scaled, mode='lines', name='Forecast', line=dict(color=col, width=4)))
-    
-    y_min, y_max = min(current), max(current)
-    span = y_max - y_min
-    for p, v in buy_walls:
-        if y_min-span < p < y_max+span: fig.add_hline(y=p, line_color="rgba(0, 255, 0, 0.4)")
-    for p, v in sell_walls:
-        if y_min-span < p < y_max+span: fig.add_hline(y=p, line_color="rgba(255, 0, 0, 0.4)")
-
-    fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0,r=0,t=10,b=0), plot_bgcolor='#0E1117', paper_bgcolor='#0E1117')
-    return fig
-
-def plot_bar(series, title, color_pos="#00c853", color_neg="#d50000"):
-    colors = [color_pos if v > 0 else color_neg for v in series.values]
-    fig = go.Figure(go.Bar(x=series.index, y=series.values, marker_color=colors))
-    fig.update_layout(template="plotly_dark", title=title, height=250, margin=dict(l=0,r=0,t=40,b=0), plot_bgcolor='#0E1117', paper_bgcolor='#0E1117')
-    return fig
-
-# --- 6. MAIN APP ---
-st.sidebar.header("🦅 Omni-Sniper")
-sym = st.sidebar.text_input("Symbol", "BTC").upper()
-if "-" not in sym: sym += "-USD"
-
-tf_label = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minutes", "15 Minutes", "1 Hour", "6 Hours", "1 Day"])
-tf_map = {"1 Minute": 60, "5 Minutes": 300, "15 Minutes": 900, "1 Hour": 3600, "6 Hours": 21600, "1 Day": 86400}
-granularity = tf_map[tf_label]
-
-st.title(f"🔍 {sym} Market Intelligence")
-
-if st.button("🚀 Analyze Market"):
-    with st.spinner("Crunching Institutional Data..."):
-        book_res, candle_res = get_data(sym, granularity)
-        # BUG FIX: Ensure we call the function with the right name
-        df_season = get_long_term_seasonality(sym)
+        if 'NetProfit' in fund.columns: fund.rename(columns={'NetProfit': 'Net profit'}, inplace=True)
+        if 'Equity' in fund.columns: fund.rename(columns={'Equity': 'Equity Share Capital'}, inplace=True)
         
-    if book_res and candle_res:
-        df, price, bids, asks = process_data(book_res, candle_res)
-        
-        # Use season data for patterns if available (more history), otherwise use Coinbase data
-        search_df = df_season if df_season is not None else df
-        matches, current = find_patterns(search_df)
-        
-        buy_walls, sell_walls = get_walls(bids, asks, price)
-        var_95, upside, vol = run_risk(price, df, granularity/60)
-        
-        if matches:
-            avg_move = np.mean([m['pct'] for m in matches])
-            win_rate = sum(1 for m in matches if m['pct'] > 0) / len(matches) * 100
-        else: avg_move, win_rate = 0, 0
+        return scores, fund, price
+    except FileNotFoundError:
+        return None, None, None
 
-        # METRICS
-        c1, c2, c3, c4 = st.columns(4)
-        def card(col, label, value, sub="", color="white"):
-            col.markdown(f"""<div style="background:#161b22;padding:15px;border-radius:10px;border:1px solid #30363d;text-align:center;"><p style="color:#8b949e;font-size:12px;margin:0;">{label}</p><p style="color:{color};font-size:24px;font-weight:bold;margin:5px 0;">{value}</p><p style="color:#8b949e;font-size:10px;margin:0;">{sub}</p></div>""", unsafe_allow_html=True)
+# --- MAIN APP LOGIC ---
+scores_df, fund_df, price_df = load_base_data()
+if scores_df is None: 
+    st.error("❌ Critical Error: Data files not found.")
+    st.stop()
 
-        risk_color = "#ff5252" if vol > 0.005 else "#69f0ae"
-        fractal_color = "#69f0ae" if avg_move > 0 else "#ff5252"
+# --- SIDEBAR ---
+st.sidebar.title("🚀 Gramdev Dynamic")
+page = st.sidebar.radio("Go to", ["📊 Executive Dashboard", "🔮 Phase A: AI Forecasting", "⚖️ Phase B: Portfolio Mgmt"])
 
-        card(c1, "CURRENT PRICE", f"${price:,.2f}", "Live Data")
-        card(c2, "VOLATILITY", f"{vol*100:.2f}%", "Risk Level", risk_color)
-        card(c3, "HISTORICAL MATCHES", f"{len(matches)}", f"Win Rate: {win_rate:.0f}%")
-        card(c4, "FRACTAL FORECAST", f"{avg_move:+.2f}%", "Next 10 Candles", fractal_color)
+st.sidebar.markdown("---")
+st.sidebar.header("🔴 Live Data Connection")
+use_live = st.sidebar.checkbox("Enable Yahoo Finance", value=True)
 
-        st.markdown("---")
+# Helper to manage data state
+if 'live_price_df' not in st.session_state:
+    st.session_state['live_price_df'] = price_df.copy()
+
+# --- PAGE 1: DASHBOARD ---
+if page == "📊 Executive Dashboard":
+    st.title("📊 Dynamic Executive Summary")
+    
+    # 1. Select Company
+    valid_tickers = sorted(scores_df['Ticker'].unique())
+    ticker = st.selectbox("Select Company", valid_tickers)
+    
+    # 2. Yahoo Ticker Mapping
+    yahoo_symbol = st.sidebar.text_input("Yahoo Ticker Symbol", f"{ticker}.NS")
+    
+    # 3. Live Data Update Logic
+    active_df = price_df[price_df['Ticker'] == ticker].sort_values('Date')
+    
+    if use_live:
+        with st.spinner(f"Connecting to live market for {ticker}..."):
+            updated_df, new_rows = fetch_live_data(active_df, ticker, yahoo_symbol)
+            if new_rows > 0:
+                st.toast(f"✅ Fetched {new_rows} new days of data!", icon="📈")
+            elif new_rows == -1:
+                st.error("⚠️ Failed to fetch live data. Check Ticker Symbol.")
+            active_df = updated_df
+
+    # 4. Display Metrics
+    sub_f = fund_df[fund_df['Ticker'] == ticker].sort_values('Date')
+    score = scores_df[scores_df['Ticker'] == ticker]['Moat_Score'].values[0]
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Moat Score", f"{score}/100")
+    
+    last_price = active_df.iloc[-1]['Close'] if not active_df.empty else 0
+    c2.metric("Latest Price", f"₹{last_price:,.2f}")
+    
+    col = 'Sales' if 'Sales' in sub_f.columns else sub_f.columns[2]
+    last_sales = sub_f.iloc[-1][col] if not sub_f.empty else 0
+    c3.metric("Latest Sales", f"₹{last_sales:,.2f} Cr")
+    
+    # 5. Chart
+    if not active_df.empty:
+        fig = px.line(active_df, x='Date', y='Close', title=f"{ticker} Live Price History")
+        st.plotly_chart(fig, use_container_width=True)
+
+# --- PAGE 2: FORECASTING ---
+elif page == "🔮 Phase A: AI Forecasting":
+    st.title("🔮 Phase A: Dynamic Forecasting")
+    
+    ticker = st.selectbox("Select Stock", sorted(price_df['Ticker'].unique()))
+    analysis_type = st.radio("Select Analysis Module", ["LSTM Price Forecast", "GARCH Volatility Risk", "ARIMA Trend"])
+    
+    # Yahoo Ticker Input for Forecast
+    yahoo_symbol = st.sidebar.text_input("Yahoo Ticker Symbol", f"{ticker}.NS")
+    
+    # Data Prep
+    active_df = price_df[price_df['Ticker'] == ticker].sort_values('Date')
+    if use_live:
+        active_df, _ = fetch_live_data(active_df, ticker, yahoo_symbol)
+    
+    if len(active_df) < 60:
+        st.error("Insufficient data.")
+    else:
+        # Date Logic
+        last_date = active_df['Date'].iloc[-1]
+        next_date = last_date + pd.Timedelta(days=1)
+        if next_date.weekday() == 5: next_date += pd.Timedelta(days=2)
+        elif next_date.weekday() == 6: next_date += pd.Timedelta(days=1)
+        date_str = next_date.strftime("%d %b %Y")
+
+        if analysis_type == "LSTM Price Forecast":
+            st.subheader("🧠 Deep Learning (LSTM)")
+            if st.button("Run Neural Network on Live Data"):
+                with st.spinner("Training Brain..."):
+                    data = active_df['Close'].values.reshape(-1, 1)
+                    scaler = MinMaxScaler(feature_range=(0, 1))
+                    scaled = scaler.fit_transform(data)
+                    
+                    X, y = [], []
+                    lookback = 60
+                    for i in range(lookback, len(scaled)):
+                        X.append(scaled[i-lookback:i, 0])
+                        y.append(scaled[i, 0])
+                    X, y = np.array(X), np.array(y)
+                    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+                    
+                    model = Sequential()
+                    model.add(LSTM(50, return_sequences=True, input_shape=(X.shape[1], 1)))
+                    model.add(LSTM(50))
+                    model.add(Dense(1))
+                    model.compile(optimizer='adam', loss='mse')
+                    model.fit(X, y, epochs=1, batch_size=1, verbose=0)
+                    
+                    last_60 = scaled[-lookback:].reshape(1, lookback, 1)
+                    pred = scaler.inverse_transform(model.predict(last_60))[0][0]
+                    
+                    st.success(f"🤖 LSTM Prediction for {date_str}: ₹{pred:.2f}")
+
+        elif analysis_type == "GARCH Volatility Risk":
+            st.subheader("⚠️ GARCH Volatility Model")
+            if st.button("Analyze Live Risk"):
+                returns = active_df['Close'].pct_change().dropna() * 100
+                am = arch_model(returns, vol='Garch', p=1, q=1)
+                res = am.fit(disp='off')
+                st.write(res.summary())
+                st.line_chart(res.conditional_volatility)
+
+        elif analysis_type == "ARIMA Trend":
+            st.subheader("📈 ARIMA Trend Model")
+            model = ARIMA(active_df['Close'], order=(5,1,0))
+            fit = model.fit()
+            forecast = fit.forecast(steps=1).iloc[0]
+            st.info(f"ARIMA Forecast for {date_str}: ₹{forecast:.2f}")
+
+# --- PAGE 3: PORTFOLIO ---
+elif page == "⚖️ Phase B: Portfolio Mgmt":
+    st.title("⚖️ Phase B: Dynamic Portfolio")
+    st.info("Note: Portfolio optimization uses the local CSV data for speed.")
+    
+    tickers = sorted(price_df['Ticker'].unique())
+    selection = st.multiselect("Select Stocks", tickers, default=tickers[:5])
+    
+    if len(selection) >= 3:
+        pivot = price_df.pivot(index='Date', columns='Ticker', values='Close')[selection].dropna()
+        returns = pivot.pct_change().dropna()
         
-        tab1, tab2, tab3 = st.tabs(["🔮 Pattern Match", "📅 Seasonality (IST)", "🎲 Risk"])
+        tab1, tab2, tab3 = st.tabs(["Clustering", "PCA", "Markowitz Opt"])
         
         with tab1:
-            if matches:
-                # 1. CHART
-                match_date = matches[0]['date'].strftime('%Y-%m-%d %H:%M')
-                st.caption(f"Top Match Date: {match_date} IST")
-                st.plotly_chart(plot_fractal_chart(current, matches[0], buy_walls, sell_walls), use_container_width=True)
-                
-                # 2. TABLE (DEEP HISTORY)
-                st.divider()
-                st.subheader(f"📜 All Historical Matches ({len(matches)} Found)")
-                
-                match_data = []
-                for m in matches:
-                    match_data.append({
-                        "Date (IST)": m['date'].strftime('%Y-%m-%d %H:%M'),
-                        "Correlation": f"{m['corr']*100:.1f}%",
-                        "Outcome": f"{m['pct']:+.2f}%",
-                        "Trend": "🟢 UP" if m['pct'] > 0 else "🔴 DOWN"
-                    })
-                st.dataframe(pd.DataFrame(match_data), use_container_width=True, hide_index=True)
-            else: st.warning("No clear history matches.")
-                
+            st.subheader("🧬 Stock Clustering")
+            k = st.slider("Clusters", 2, 5, 3)
+            kmeans = KMeans(n_clusters=k, random_state=42).fit(returns.corr())
+            st.table(pd.DataFrame({'Ticker': selection, 'Cluster': kmeans.labels_}).sort_values('Cluster'))
+            
         with tab2:
-            if df_season is not None:
-                h_stats, d_stats = calculate_simple_seasonality(df_season)
-                c_day, c_hour = st.columns(2)
-                with c_day: st.plotly_chart(plot_bar(d_stats, "Best Day"), use_container_width=True)
-                with c_hour: st.plotly_chart(plot_bar(h_stats, "Best Hour (IST)"), use_container_width=True)
-            else: st.error("Could not fetch seasonality data.")
-                
+            st.subheader("🧩 PCA Analysis")
+            pca = PCA(n_components=3).fit(returns)
+            st.bar_chart(pca.explained_variance_ratio_)
+            
         with tab3:
-            st.subheader(f"Statistical Range ({tf_label})")
-            r1, r2 = st.columns(2)
-            card(r1, "STOP LOSS (VaR 95%)", f"${var_95:,.2f}", "Downside Protection", "#ff5252")
-            card(r2, "TAKE PROFIT (Upside 95%)", f"${upside:,.2f}", "Upside Target", "#69f0ae")
-
-    else: st.error("API Error.")
+            st.subheader("🏆 Optimization")
+            if st.button("Optimize Weights"):
+                mu = returns.mean() * 252
+                cov = returns.cov() * 252
+                cons = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+                bounds = tuple((0, 1) for _ in range(len(selection)))
+                init = [1/len(selection)]*len(selection)
+                res = minimize(lambda w: -(np.sum(mu*w)/np.sqrt(np.dot(w.T,np.dot(cov,w)))), init, bounds=bounds, constraints=cons)
+                
+                df_res = pd.DataFrame({'Stock': selection, 'Weight': res.x})
+                df_res['Weight'] = df_res['Weight'].apply(lambda x: f"{x*100:.1f}%")
+                st.table(df_res)
+                st.plotly_chart(px.pie(values=res.x, names=selection, title="Optimal Allocation"))
